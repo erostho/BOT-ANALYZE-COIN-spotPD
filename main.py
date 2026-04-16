@@ -102,20 +102,19 @@ def init_sheet():
         "https://www.googleapis.com/auth/drive"
     ]
 
-    google_creds_raw = os.getenv("GOOGLE_CREDS_FILE", "")
+    raw = os.getenv("GOOGLE_CREDS_FILE", "")
 
-    if google_creds_raw.strip().startswith("{"):
-        creds_dict = json.loads(google_creds_raw)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    # fix JSON vs file path
+    if raw.strip().startswith("{"):
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(raw), scope)
     else:
-        creds = ServiceAccountCredentials.from_json_keyfile_name(google_creds_raw, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(raw, scope)
 
     client = gspread.authorize(creds)
 
-    try:
-        sh = client.open(os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER"))
-    except Exception:
-        sh = client.create(os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER"))
+    # 🔥 QUAN TRỌNG: CHỈ OPEN, KHÔNG CREATE
+    sheet_name = os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER")
+    sh = client.open(sheet_name)
 
     return sh
 
