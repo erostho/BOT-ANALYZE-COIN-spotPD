@@ -2,4 +2,3 @@ requests
 pandas
 gspread
 oauth2client
-python-dateutil
