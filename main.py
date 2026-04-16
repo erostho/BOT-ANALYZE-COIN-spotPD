@@ -510,71 +510,59 @@ def network_to_moralis_chain(network_id: str):
     return mapping.get(n, (None, None))
 
 
-def resolve_symbol_auto(inst_id: str, resolve_cache: dict):
-    """
-    Tự resolve từ symbol OKX sang token onchain.
-    """
-    if inst_id in resolve_cache:
-        return resolve_cache[inst_id]
+def resolve_with_dexscreener(symbol_base):
+    url = f"https://api.dexscreener.com/latest/dex/search?q={symbol_base}"
 
-    symbol_base = clean_symbol_base(inst_id)
+    try:
+        res = requests.get(url).json()
+        pairs = res.get("pairs", [])
+    except:
+        return None
 
-    coin_candidates = search_coingecko_coin_candidates(symbol_base)
-    onchain_candidates = search_coingecko_onchain_candidates(symbol_base)
+    if not pairs:
+        return None
 
-    best_onchain = onchain_candidates[0] if onchain_candidates else None
-    best_coin = coin_candidates[0] if coin_candidates else None
+    candidates = []
 
-    if not best_onchain:
-        result = {
-            "resolved": False,
-            "resolve_confidence": 0.0,
-            "reason": "no_onchain_candidate",
-            "coin_candidate": best_coin,
-            "onchain_candidate": None,
-            "chain_type": None,
-            "network": None,
-            "token_address": None,
-            "resolved_name": None,
-            "resolved_symbol": None,
-            "last_verified_at": utc_now_str(),
-        }
-        resolve_cache[inst_id] = result
-        return result
+    for p in pairs[:20]:
+        liquidity = float(p.get("liquidity", {}).get("usd", 0) or 0)
+        volume = float(p.get("volume", {}).get("h24", 0) or 0)
 
-    chain_type, moralis_network = network_to_moralis_chain(best_onchain.get("network"))
-    confidence = safe_float(best_onchain.get("score"), 0.0)
+        score = 0
 
-    if best_coin:
-        coin_sym = str(best_coin.get("symbol", "")).lower()
-        on_sym = str(best_onchain.get("token_symbol", "")).lower()
-        if coin_sym and on_sym and coin_sym == on_sym:
-            confidence += 10
+        if liquidity > 10000:
+            score += 20
+        if liquidity > 100000:
+            score += 20
 
-    resolved = (
-        confidence >= 80 and
-        best_onchain.get("token_address") and
-        chain_type is not None and
-        moralis_network is not None
-    )
+        if volume > 10000:
+            score += 10
 
-    result = {
-        "resolved": resolved,
-        "resolve_confidence": round(confidence, 2),
-        "reason": "ok" if resolved else "low_confidence_or_unsupported_network",
-        "coin_candidate": best_coin,
-        "onchain_candidate": best_onchain,
-        "chain_type": chain_type,
-        "network": moralis_network,
-        "token_address": best_onchain.get("token_address"),
-        "resolved_name": best_onchain.get("token_name"),
-        "resolved_symbol": best_onchain.get("token_symbol"),
-        "last_verified_at": utc_now_str(),
+        if p.get("txns", {}).get("h24", {}).get("buys", 0) > 20:
+            score += 10
+
+        candidates.append((score, p))
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    best = candidates[0][1]
+
+    return {
+        "chain": best.get("chainId"),
+        "token_address": best.get("baseToken", {}).get("address"),
+        "symbol": best.get("baseToken", {}).get("symbol"),
+        "liquidity": best.get("liquidity", {}).get("usd")
     }
-    resolve_cache[inst_id] = result
-    return result
-
-
+def map_chain(chain):
+    mapping = {
+        "bsc": ("evm", "bsc"),
+        "ethereum": ("evm", "eth"),
+        "polygon": ("evm", "polygon"),
+        "arbitrum": ("evm", "arbitrum"),
+        "base": ("evm", "base"),
+        "solana": ("solana", "mainnet")
+    }
+    return mapping.get(chain, (None, None))
 # =========================================================
 # MORALIS HOLDER
 # =========================================================
