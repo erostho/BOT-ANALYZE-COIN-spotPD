@@ -1,1147 +1,1134 @@
 import os
 import json
-import math
 import time
-import hashlib
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, Tuple
+import traceback
+from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
-from dateutil import tz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 
-# ========================
-#  Config
-# ========================
+# =========================================================
+# CONFIG
+# =========================================================
+SHEET_NAME = os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER")
+GOOGLE_CREDS_FILE = os.getenv("GOOGLE_CREDS_FILE", "credentials.json")
 
-OKX_BASE_URL = "https://www.okx.com"
-OKX_INST_ID = os.getenv("OKX_INST_ID", "BTC-USDT-SWAP")
+OKX_TIMEFRAME = os.getenv("OKX_TIMEFRAME", "1H")
+OKX_CANDLE_LIMIT = int(os.getenv("OKX_CANDLE_LIMIT", "100"))
+PRICE_MAX = float(os.getenv("PRICE_MAX", "1"))
+ONLY_USDT_QUOTE = os.getenv("ONLY_USDT_QUOTE", "true").lower() == "true"
 
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "OKX_BOT")
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+MORALIS_API_KEY = os.getenv("MORALIS_API_KEY", "")
 
-EXNESS_PRICE_URL = os.getenv("EXNESS_PRICE_URL")  # endpoint trả JSON giá Exness
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+SLEEP_BETWEEN_SYMBOLS = float(os.getenv("SLEEP_BETWEEN_SYMBOLS", "0.06"))
+TRACKING_MAX_DAYS = int(os.getenv("TRACKING_MAX_DAYS", "90"))
+SENT_FILE = os.getenv("SENT_FILE", "sent.json")
 
-TIMEFRAMES = {
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",      # KHUNG TRADE CHÍNH
-    "1H": "1H",
-    "2H": "2H",
-    "4H": "4H",
-}
+# chỉ enrich holder cho nhóm mạnh
+RESOLVE_TOP_N = int(os.getenv("RESOLVE_TOP_N", "80"))
+RESOLVE_STATUS_SET = set(
+    s.strip().upper()
+    for s in os.getenv("RESOLVE_STATUS_SET", "EARLY_FLOW,PRE_BREAK,BREAKOUT,PUMPING").split(",")
+    if s.strip()
+)
 
-VN_TZ = tz.gettz("Asia/Ho_Chi_Minh")
-
-
-# ========================
-#  Helpers
-# ========================
-
-def _log(msg: str) -> None:
-    print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
+ALERT_MIN_SCORE_PREBREAK = float(os.getenv("ALERT_MIN_SCORE_PREBREAK", "7.0"))
+ALERT_MIN_SCORE_EARLY = float(os.getenv("ALERT_MIN_SCORE_EARLY", "6.5"))
+ALERT_MIN_SCORE_BREAKOUT = float(os.getenv("ALERT_MIN_SCORE_BREAKOUT", "7.5"))
 
 
-def connect_gsheet():
-    if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
-        raise RuntimeError("Missing GOOGLE_SHEET_ID or GOOGLE_SERVICE_ACCOUNT_JSON env")
+# =========================================================
+# HTTP
+# =========================================================
+session = requests.Session()
+session.headers.update({"User-Agent": "okx-spot-hunter-v4/1.0"})
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def utc_now_str():
+    return utc_now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def clean_symbol_base(inst_id: str) -> str:
+    # RAVE-USDT -> RAVE
+    return inst_id.split("-")[0].strip().lower()
+
+
+def json_load_file(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def json_save_file(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# =========================================================
+# GOOGLE SHEETS
+# =========================================================
+def init_sheet():
     scope = [
         "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive"
     ]
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_FILE, scope)
     client = gspread.authorize(creds)
-    return client.open_by_key(GOOGLE_SHEET_ID)
+
+    try:
+        sh = client.open(SHEET_NAME)
+    except Exception:
+        sh = client.create(SHEET_NAME)
+    return sh
 
 
-def get_or_create_worksheet(sh, title: str, rows: int = 100, cols: int = 20):
+def get_or_create_ws(sh, title, rows=3000, cols=40):
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
 
-def fetch_okx_candles(tf: str, limit: int = 120) -> pd.DataFrame:
-    """
-    Lấy dữ liệu nến OKX cho 1 timeframe.
-    Trả về DataFrame với index = datetime (UTC) & cột: open, high, low, close, volume.
-    """
-    url = f"{OKX_BASE_URL}/api/v5/market/candles"
-    params = {
-        "instId": OKX_INST_ID,
-        "bar": tf,
-        "limit": str(limit),
-    }
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        raise RuntimeError(f"Empty candles from OKX for {tf}")
-
-    # OKX trả newest first -> đảo lại
-    records = []
-    for row in reversed(data):
-        ts_ms = int(row[0])
-        dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-        o, h, l, c, vol = map(float, row[1:6])
-        records.append(
-            {
-                "time": dt,
-                "open": o,
-                "high": h,
-                "low": l,
-                "close": c,
-                "volume": vol,
-            }
-        )
-
-    df = pd.DataFrame(records).set_index("time")
-    return df
+def worksheet_to_df(ws):
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame()
+    header = values[0]
+    rows = values[1:]
+    if not rows:
+        return pd.DataFrame(columns=header)
+    return pd.DataFrame(rows, columns=header)
 
 
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return atr
-
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ma_up = up.rolling(window=period).mean()
-    ma_down = down.rolling(window=period).mean()
-    rs = ma_up / ma_down
-    rsi_val = 100 - (100 / (1 + rs))
-    return rsi_val
-
-
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-
-def detect_trend_from_ema(last_row: pd.Series) -> str:
-    ema20 = last_row["ema20"]
-    ema50 = last_row["ema50"]
-    close = last_row["close"]
-    if close > ema50 and ema20 > ema50:
-        return "UP"
-    if close < ema50 and ema20 < ema50:
-        return "DOWN"
-    return "SIDE"
-
-
-def _detect_swings(
-    df: pd.DataFrame,
-    lookback: int = 60,
-    left: int = 2,
-    right: int = 2,
-) -> Tuple[List[Tuple[pd.Timestamp, float]], List[Tuple[pd.Timestamp, float]]]:
-    """
-    Tìm swing high / swing low dạng fractal:
-    - swing high: high[i] > high[i-k] & high[i] > high[i+k] (k=1..left/right)
-    - swing low  : low[i]  < low[i-k] & low[i]  < low[i+k]
-    Chỉ dùng phần đuôi 'lookback' để nhẹ.
-    """
-    sub = df.tail(lookback)
-    highs = sub["high"]
-    lows = sub["low"]
-    idx = list(sub.index)
-
-    swing_highs: List[Tuple[pd.Timestamp, float]] = []
-    swing_lows: List[Tuple[pd.Timestamp, float]] = []
-
-    n = len(sub)
-    for i in range(left, n - right):
-        h = highs.iloc[i]
-        l = lows.iloc[i]
-        ok_high = True
-        ok_low = True
-        for k in range(1, left + 1):
-            if h <= highs.iloc[i - k]:
-                ok_high = False
-                break
-        for k in range(1, right + 1):
-            if h <= highs.iloc[i + k]:
-                ok_high = False
-                break
-        for k in range(1, left + 1):
-            if l >= lows.iloc[i - k]:
-                ok_low = False
-                break
-        for k in range(1, right + 1):
-            if l >= lows.iloc[i + k]:
-                ok_low = False
-                break
-
-        ts = idx[i]
-        if ok_high:
-            swing_highs.append((ts, float(h)))
-        if ok_low:
-            swing_lows.append((ts, float(l)))
-
-    return swing_highs, swing_lows
-
-
-def classify_market_structure(df: pd.DataFrame, lookback: int = 80) -> str:
-    """
-    Phân loại cấu trúc thị trường bằng swing high/low:
-    - Tăng (HH–HL): ít nhất 3 swing high & 3 swing low, cả hai đều tăng dần ở 3 điểm cuối
-    - Giảm (LH–LL): tương tự nhưng giảm dần
-    - Ngược lại: Sideway / lẫn lộn
-    """
-    swing_highs, swing_lows = _detect_swings(df, lookback=lookback)
-
-    if len(swing_highs) < 3 or len(swing_lows) < 3:
-        return "Không rõ (thiếu swing)"
-
-    last_highs = [p for _, p in swing_highs[-3:]]
-    last_lows = [p for _, p in swing_lows[-3:]]
-
-    def _is_increasing(vals: List[float]) -> bool:
-        return vals[0] < vals[1] < vals[2]
-
-    def _is_decreasing(vals: List[float]) -> bool:
-        return vals[0] > vals[1] > vals[2]
-
-    if _is_increasing(last_highs) and _is_increasing(last_lows):
-        return "Tăng (HH–HL)"
-    if _is_decreasing(last_highs) and _is_decreasing(last_lows):
-        return "Giảm (LH–LL)"
-    return "Sideway / lẫn lộn"
-
-
-def classify_atr(atr_value: float) -> str:
-    if pd.isna(atr_value):
-        return "Chưa đủ dữ liệu ATR"
-    if atr_value < 80:
-        return "Biến động rất thấp / sideway chặt"
-    if atr_value < 150:
-        return "Sideway nhẹ, dao động nhỏ"
-    if atr_value < 250:
-        return "Biến động vừa"
-    if atr_value < 350:
-        return "Thị trường bắt đầu mạnh"
-    if atr_value < 600:
-        return "Trend mạnh, breakout mạnh"
-    return "Biến động cực mạnh (thường khi có tin tức)"
-
-
-def get_exness_price() -> Optional[float]:
-    if not EXNESS_PRICE_URL:
-        return None
-    try:
-        r = requests.get(EXNESS_PRICE_URL, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, dict):
-            for key in ["price", "last", "ask", "bid"]:
-                if key in data and isinstance(data[key], (int, float)):
-                    return float(data[key])
-            if "data" in data and isinstance(data["data"], dict):
-                d2 = data["data"]
-                for key in ["price", "last", "ask", "bid"]:
-                    if key in d2 and isinstance(d2[key], (int, float)):
-                        return float(d2[key])
-        if isinstance(data, list) and data and isinstance(data[0], (int, float)):
-            return float(data[0])
-    except Exception as e:
-        _log(f"get_exness_price error: {e}")
-    return None
-
-
-def to_exness_price(okx_price: float, diff: float) -> float:
-    return okx_price + diff
-
-
-def get_session_note(now_utc: datetime) -> str:
-    vn_time = now_utc.astimezone(VN_TZ)
-    hour = vn_time.hour
-    if 7 <= hour < 14:
-        return f"Giờ VN {vn_time.strftime('%H:%M')} – phiên Á, thường dao động vừa phải."
-    if 14 <= hour < 20:
-        return f"Giờ VN {vn_time.strftime('%H:%M')} – phiên Âu, thị trường sôi động dần."
-    return f"Giờ VN {vn_time.strftime('%H:%M')} – phiên Mỹ, thị trường thường sôi động mạnh."
-
-
-def get_session_type(now_utc: datetime) -> str:
-    """
-    Trả về: 'ASIA' / 'EU' / 'US'
-    """
-    vn_time = now_utc.astimezone(VN_TZ)
-    hour = vn_time.hour
-    if 7 <= hour < 14:
-        return "ASIA"
-    if 14 <= hour < 20:
-        return "EU"
-    return "US"
-
-
-def get_retrace_zones(direction: str, last_close: float, atr: float) -> Dict[str, Any]:
-    """
-    Tính vùng hồi / điều chỉnh dựa trên ATR quanh giá hiện tại.
-    direction: "up" (hồi lên) hoặc "down" (điều chỉnh xuống)
-    """
-    if pd.isna(atr) or atr <= 0:
-        return {"direction": direction, "zones": []}
-
-    zones = []
-    if direction == "up":
-        zones.append(("Vùng 1", last_close + 0.3 * atr, last_close + 0.6 * atr))
-        zones.append(("Vùng 2", last_close + 0.6 * atr, last_close + 0.9 * atr))
-        zones.append(("Vùng 3 (thấp)", last_close + 0.1 * atr, last_close + 0.3 * atr))
-    else:
-        zones.append(("Vùng 1", last_close - 0.6 * atr, last_close - 0.3 * atr))
-        zones.append(("Vùng 2", last_close - 0.9 * atr, last_close - 0.6 * atr))
-        zones.append(("Vùng 3 (cao)", last_close - 0.3 * atr, last_close - 0.1 * atr))
-
-    return {"direction": direction, "zones": zones}
-
-
-def detect_regime(rsi_val: float, atr: float) -> str:
-    """
-    Xác định chế độ: TREND / SIDEWAY / MIXED.
-    ATR lớn + RSI xa 50 -> TREND, ngược lại SIDEWAY.
-    """
-    if pd.isna(atr) or pd.isna(rsi_val):
-        return "UNKNOWN"
-    if atr > 250 and (rsi_val > 60 or rsi_val < 40):
-        return "TREND"
-    if atr < 150 and 45 <= rsi_val <= 55:
-        return "SIDEWAY"
-    return "MIXED"
-
-
-def build_trade_suggestion(trade_signal: str, last_row: pd.Series, atr: float) -> Optional[Dict[str, Any]]:
-    """
-    trade_signal:
-      - "SHORT mạnh" / "LONG mạnh"  -> trend-follow, ATR-based (khung 30m)
-      - "LONG hồi kỹ thuật" / "SHORT hồi kỹ thuật" -> counter-trend, TP gần / SL chặt
-    """
-    close = float(last_row["close"])
-    if pd.isna(atr) or atr <= 0:
-        return None
-
-    # Trend-follow: dùng ATR rộng hơn
-    if trade_signal == "SHORT mạnh":
-        entry = close
-        tp = close - 1.2 * atr
-        sl = close + 0.8 * atr
-        return {"side": "SHORT", "entry": entry, "tp": tp, "sl": sl}
-
-    if trade_signal == "LONG mạnh":
-        entry = close
-        tp = close + 1.2 * atr
-        sl = close - 0.8 * atr
-        return {"side": "LONG", "entry": entry, "tp": tp, "sl": sl}
-
-    # Hồi kỹ thuật: TP gần, SL chặt (ngược trend chính)
-    rr = 1.1  # risk reward cho hồi kỹ thuật
-    if trade_signal == "LONG hồi kỹ thuật":
-        entry = close
-        sl = close - 0.5 * atr
-        tp = entry + rr * (entry - sl)
-        return {"side": "LONG", "entry": entry, "tp": tp, "sl": sl}
-
-    if trade_signal == "SHORT hồi kỹ thuật":
-        entry = close
-        sl = close + 0.5 * atr
-        tp = entry - rr * (sl - entry)
-        return {"side": "SHORT", "entry": entry, "tp": tp, "sl": sl}
-
-    return None
-
-
-def sheet_read_last_message_hash(ws_cache) -> Optional[str]:
-    try:
-        val = ws_cache.acell("A1").value
-        return val or None
-    except Exception:
-        return None
-
-
-def sheet_write_last_message_hash(ws_cache, h: str) -> None:
-    ws_cache.update_acell("A1", h)
-
-
-def compute_message_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def send_telegram_message(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        _log("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID, skip telegram")
+def overwrite_worksheet(ws, df: pd.DataFrame):
+    ws.clear()
+    if df.empty:
+        ws.update([["EMPTY"]])
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+    ws.update(values)
+
+
+def append_rows(ws, rows):
+    if rows:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+def send_telegram(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
     }
-    r = requests.post(url, json=payload, timeout=10)
-    if not r.ok:
-        _log(f"Telegram send error: {r.status_code} {r.text}")
+    try:
+        session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+    except Exception:
+        pass
 
 
-# ========================
-#  Trend Reliability & News filter
-# ========================
+def load_sent():
+    return json_load_file(SENT_FILE, {})
 
-def compute_trend_reliability(
-    main_trend: str,
-    trend_main: str,          # trend khung 30m (EMA)
-    ms_main: str,             # market structure 30m
-    ms_sub: str,              # market structure 15m
-    tf_trends: Dict[str, Dict[str, Any]],
-    last_main: pd.Series,     # nến 30m cuối
-    atr_main: float,
-    rsi_main: float,
-    vol_main: float,
-    vol_ma20_main: float,
-) -> Tuple[int, str]:
+
+def save_sent(sent):
+    json_save_file(SENT_FILE, sent)
+
+
+def cleanup_sent(sent, keep_days=7):
+    cutoff = utc_now() - timedelta(days=keep_days)
+    out = {}
+    for k, v in sent.items():
+        try:
+            ts = datetime.fromisoformat(v["time"])
+            if ts >= cutoff:
+                out[k] = v
+        except Exception:
+            out[k] = v
+    return out
+
+
+# =========================================================
+# OKX
+# =========================================================
+def fetch_okx_spot_tickers():
+    url = "https://www.okx.com/api/v5/market/tickers"
+    params = {"instType": "SPOT"}
+    r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json().get("data", [])
+
+
+def fetch_okx_candles(inst_id: str):
+    url = "https://www.okx.com/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": OKX_TIMEFRAME,
+        "limit": str(OKX_CANDLE_LIMIT)
+    }
+    r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    if not data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data, columns=[
+        "ts", "open", "high", "low", "close",
+        "vol", "volCcy", "volCcyQuote", "confirm"
+    ])
+    for c in ["ts", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.sort_values("ts").reset_index(drop=True)
+    return df
+
+
+# =========================================================
+# FEATURE ENGINEERING
+# =========================================================
+def calc_features(df: pd.DataFrame):
+    if df.empty or len(df) < 60:
+        return None
+
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    vol = df["vol"]
+
+    price = safe_float(close.iloc[-1], 0.0)
+    if price <= 0:
+        return None
+
+    vol_recent = safe_float(vol.tail(10).mean(), 0.0)
+    vol_old = safe_float(vol.iloc[-60:-10].mean(), 0.0)
+    vol_ratio = vol_recent / (vol_old + 1e-9)
+
+    range_now = safe_float(high.tail(20).max() - low.tail(20).min(), 0.0)
+    range_old = safe_float(high.iloc[-60:-20].max() - low.iloc[-60:-20].min(), 0.0)
+    compression = range_now / (range_old + 1e-9) if range_old > 0 else 1.0
+
+    low_recent = safe_float(low.tail(20).min(), 0.0)
+    low_old = safe_float(low.iloc[-60:-20].min(), 0.0)
+    higher_low = low_recent > low_old
+
+    high_60 = safe_float(high.tail(60).max(), 0.0)
+    low_60 = safe_float(low.tail(60).min(), 0.0)
+    break_pressure = price / (high_60 + 1e-9)
+
+    close_10 = safe_float(close.iloc[-10], price)
+    close_20 = safe_float(close.iloc[-20], price)
+    roc_10 = (price / (close_10 + 1e-9)) - 1.0
+    roc_20 = (price / (close_20 + 1e-9)) - 1.0
+    pos_in_range = (price - low_60) / ((high_60 - low_60) + 1e-9)
+
+    returns = close.pct_change().dropna()
+    vol_20 = safe_float(returns.tail(20).std(), 0.0)
+
+    return {
+        "price": round(price, 8),
+        "vol_ratio": round(vol_ratio, 6),
+        "compression": round(compression, 6),
+        "higher_low": bool(higher_low),
+        "break_pressure": round(break_pressure, 6),
+        "roc_10": round(roc_10, 6),
+        "roc_20": round(roc_20, 6),
+        "pos_in_range": round(pos_in_range, 6),
+        "volatility_20": round(vol_20, 6),
+        "range_high_60": round(high_60, 8),
+        "range_low_60": round(low_60, 8),
+    }
+
+
+def classify_status(f):
+    if f is None:
+        return "DEAD"
+
+    vr = f["vol_ratio"]
+    cp = f["compression"]
+    hl = f["higher_low"]
+    bp = f["break_pressure"]
+    roc10 = f["roc_10"]
+
+    if vr < 0.75 and bp < 0.85:
+        return "DEAD"
+    if vr < 0.90 and cp >= 0.85:
+        return "SLEEPING"
+    if vr >= 1.10 and cp >= 0.80 and not hl:
+        return "WAKING_UP"
+    if vr >= 1.25 and hl and bp >= 0.82:
+        return "EARLY_FLOW"
+    if vr >= 1.35 and cp <= 0.75 and hl and bp >= 0.90:
+        return "PRE_BREAK"
+    if bp >= 0.985 and roc10 > 0.03:
+        return "BREAKOUT"
+    if roc10 > 0.12 and bp >= 0.99:
+        return "PUMPING"
+    if roc10 < -0.10:
+        return "DUMPING"
+    return "SLEEPING"
+
+
+def calc_score(f, status, holder_score=0.0):
+    if f is None:
+        return 0.0
+
+    vol_component = clamp(f["vol_ratio"], 0.0, 3.0) * 2.0
+    compression_component = (1.0 - clamp(f["compression"], 0.0, 1.2)) * 2.0
+    structure_component = 1.0 if f["higher_low"] else 0.0
+    break_component = clamp(f["break_pressure"], 0.0, 1.1) * 2.0
+    momentum_component = clamp(max(f["roc_10"], 0.0), 0.0, 0.20) * 10.0
+
+    status_bonus = {
+        "WAKING_UP": 0.5,
+        "EARLY_FLOW": 2.0,
+        "PRE_BREAK": 3.0,
+        "BREAKOUT": 2.0,
+        "PUMPING": 1.0,
+        "DUMPING": -1.0,
+        "DEAD": -1.0,
+    }.get(status, 0.0)
+
+    total = (
+        vol_component +
+        compression_component +
+        structure_component +
+        break_component +
+        momentum_component +
+        status_bonus +
+        holder_score
+    )
+    return round(max(total, 0.0), 2)
+
+
+def calc_priority(status, score):
+    if status in ["PRE_BREAK", "EARLY_FLOW"] and score >= 8:
+        return "EXTREME"
+    if status in ["PRE_BREAK", "EARLY_FLOW", "BREAKOUT"] and score >= 6.5:
+        return "HOT"
+    if status in ["WAKING_UP", "EARLY_FLOW", "BREAKOUT"] and score >= 5:
+        return "GOOD"
+    if status in ["DEAD", "DUMPING", "LATE"]:
+        return "AVOID"
+    return "WATCH"
+
+
+# =========================================================
+# COINGECKO AUTO-RESOLVE
+# =========================================================
+def cg_headers():
+    headers = {}
+    if COINGECKO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    return headers
+
+
+def cg_get(path, params=None):
+    base = "https://pro-api.coingecko.com/api/v3" if COINGECKO_API_KEY else "https://api.coingecko.com/api/v3"
+    url = f"{base}{path}"
+    r = session.get(url, headers=cg_headers(), params=params or {}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def search_coingecko_coin_candidates(symbol_base: str):
     """
-    Trend Reliability Index (TRI) 0–100 cho khung 30m.
-    Dựa trên:
-    - Đồng hướng đa khung
-    - EMA20–EMA50 spread
-    - RSI lệch khỏi 50
-    - Volume ủng hộ xu hướng
+    Tìm candidate coin-level trước bằng /search
     """
-    tri = 0
+    try:
+        js = cg_get("/search", params={"query": symbol_base})
+        coins = js.get("coins", []) or []
+    except Exception:
+        return []
 
-    # 30m cùng hướng trend chính
-    if main_trend in ("UP", "DOWN") and trend_main == main_trend:
-        tri += 15
+    out = []
+    sym_l = symbol_base.lower().strip()
+    for c in coins[:15]:
+        cg_symbol = str(c.get("symbol", "")).lower()
+        cg_name = str(c.get("name", "")).lower()
+        score = 0.0
+        if cg_symbol == sym_l:
+            score += 70
+        elif sym_l in cg_symbol:
+            score += 35
 
-    # Market structure 30m
-    if ("Tăng" in ms_main and main_trend == "UP") or ("Giảm" in ms_main and main_trend == "DOWN"):
-        tri += 15
+        if sym_l == cg_name:
+            score += 30
+        elif sym_l in cg_name:
+            score += 10
 
-    # 15m phụ cùng hướng
-    if ("Tăng" in ms_sub and main_trend == "UP") or ("Giảm" in ms_sub and main_trend == "DOWN"):
-        tri += 10
+        if c.get("market_cap_rank") is not None:
+            score += 5
 
-    # 1H cùng hướng
-    t1h = tf_trends.get("1H", {}).get("trend")
-    if t1h == main_trend:
-        tri += 10
+        out.append({
+            "source": "cg_search",
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "symbol": c.get("symbol"),
+            "market_cap_rank": c.get("market_cap_rank"),
+            "score": round(score, 2),
+        })
 
-    # EMA spread
-    if atr_main > 0:
-        ema_spread = abs(float(last_main["ema20"] - last_main["ema50"]))
-        if ema_spread >= 0.4 * atr_main:
-            tri += 20
-
-    # RSI 30m
-    if not math.isnan(rsi_main):
-        if main_trend == "UP" and rsi_main >= 55:
-            tri += 15
-        elif main_trend == "DOWN" and rsi_main <= 45:
-            tri += 15
-
-    # Volume 30m
-    if vol_ma20_main > 0 and vol_main >= 1.2 * vol_ma20_main:
-        tri += 15
-
-    tri = max(0, min(100, tri))
-
-    if tri < 40:
-        desc = "Trend yếu / dễ nhiễu"
-    elif tri < 60:
-        desc = "Trend trung bình"
-    elif tri < 80:
-        desc = "Trend khá tin cậy"
-    else:
-        desc = "Trend rất mạnh & tin cậy"
-
-    return tri, desc
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
 
 
-def detect_news_like_bar(
-    df_main: pd.DataFrame,   # 30m
-    atr_main: float,
-    df_sub: pd.DataFrame,    # 15m
-    atr_sub: float,
-) -> bool:
+def search_coingecko_onchain_candidates(symbol_base: str):
     """
-    Nến "giống nến tin" khi biên độ > 3×ATR trên khung chính (30m) hoặc phụ (15m).
+    Tìm candidate token-level bằng onchain search pools
     """
-    if atr_main <= 0 and atr_sub <= 0:
-        return False
+    try:
+        js = cg_get("/onchain/search/pools", params={"query": symbol_base})
+    except Exception:
+        return []
 
-    # 30m
-    last_main = df_main.iloc[-1]
-    prev_main = df_main.iloc[-2]
-    tr_last_main = float(last_main["high"] - last_main["low"])
-    tr_prev_main = float(prev_main["high"] - prev_main["low"])
-    news_main = False
-    if atr_main > 0:
-        if tr_last_main > 3 * atr_main or tr_prev_main > 3 * atr_main:
-            news_main = True
+    data = js.get("data", []) or []
+    included = js.get("included", []) or []
 
-    # 15m
-    last_sub = df_sub.iloc[-1]
-    prev_sub = df_sub.iloc[-2]
-    tr_last_sub = float(last_sub["high"] - last_sub["low"])
-    tr_prev_sub = float(prev_sub["high"] - prev_sub["low"])
-    news_sub = False
-    if atr_sub > 0:
-        if tr_last_sub > 3 * atr_sub or tr_prev_sub > 3 * atr_sub:
-            news_sub = True
+    token_map = {}
+    for inc in included:
+        inc_type = inc.get("type")
+        attrs = inc.get("attributes", {}) or {}
+        if inc_type == "token":
+            token_map[inc.get("id")] = {
+                "token_name": attrs.get("name"),
+                "token_symbol": attrs.get("symbol"),
+                "address": attrs.get("address"),
+            }
 
-    return news_main or news_sub
+    sym_l = symbol_base.lower().strip()
+    out = []
+
+    for item in data[:30]:
+        attrs = item.get("attributes", {}) or {}
+        rel = item.get("relationships", {}) or {}
+        net = item.get("relationships", {}).get("network", {}).get("data", {})
+        network_id = net.get("id")
+
+        token_links = rel.get("base_token", {}).get("data") or {}
+        token_id = token_links.get("id")
+        token_info = token_map.get(token_id, {})
+
+        token_symbol = str(token_info.get("token_symbol", "")).lower()
+        token_name = str(token_info.get("token_name", "")).lower()
+        address = token_info.get("address")
+
+        score = 0.0
+        if token_symbol == sym_l:
+            score += 80
+        elif sym_l in token_symbol:
+            score += 40
+
+        if sym_l == token_name:
+            score += 25
+        elif sym_l in token_name:
+            score += 10
+
+        reserve_usd = safe_float(attrs.get("reserve_in_usd"), 0.0)
+        volume_usd = safe_float(attrs.get("volume_usd", {}).get("h24"), 0.0)
+        tx_count = safe_float(attrs.get("transactions", {}).get("h24", {}).get("buys"), 0.0) + safe_float(
+            attrs.get("transactions", {}).get("h24", {}).get("sells"), 0.0
+        )
+
+        if reserve_usd > 10000:
+            score += 10
+        if reserve_usd > 100000:
+            score += 10
+        if volume_usd > 10000:
+            score += 5
+        if tx_count > 20:
+            score += 5
+
+        out.append({
+            "source": "cg_onchain_search",
+            "network": network_id,
+            "token_address": address,
+            "token_symbol": token_info.get("token_symbol"),
+            "token_name": token_info.get("token_name"),
+            "pool_address": attrs.get("address"),
+            "reserve_usd": reserve_usd,
+            "volume_usd_h24": volume_usd,
+            "score": round(score, 2),
+        })
+
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
 
 
-# ========================
-#  Signal quality scoring
-# ========================
-
-def compute_signal_score(
-    main_trend: str,
-    trend_main: str,
-    ms_main: str,
-    ms_sub: str,
-    rsi_main: float,
-    atr_main: float,
-    last_main: pd.Series,
-    prev1_main: pd.Series,
-    prev2_main: pd.Series,
-    vol_ma20_main: float,
-    trade_signal: Optional[str],
-    is_ma5_up: bool,
-    is_ma5_down: bool,
-    tri_score: int,
-    session_type: str,
-    news_like: bool,
-) -> Tuple[int, int, int, int]:
+def network_to_moralis_chain(network_id: str):
     """
-    Chấm điểm chất lượng tín hiệu (khung 30m):
-    - Trend score  (0–40)
-    - Momentum     (0–30)
-    - Location     (0–30)
-    + điều chỉnh bởi:
-      - TRI (trend reliability)
-      - phiên (ASIA/EU/US)
-      - news-like bar
-    Tổng: 0–100
+    map network ID bên CoinGecko onchain sang Moralis chain slug
     """
-    trend_score = 0
-    momentum_score = 0
-    location_score = 0
+    if not network_id:
+        return None, None
 
-    # --- Trend score cơ bản ---
-    if main_trend in ("UP", "DOWN") and trend_main == main_trend:
-        trend_score += 15
-
-    if ("Tăng" in ms_main and main_trend == "UP") or ("Giảm" in ms_main and main_trend == "DOWN"):
-        trend_score += 10
-    if ("Tăng" in ms_sub and main_trend == "UP") or ("Giảm" in ms_sub and main_trend == "DOWN"):
-        trend_score += 10
-
-    if not math.isnan(rsi_main):
-        if main_trend == "UP" and rsi_main >= 55:
-            trend_score += 5
-        elif main_trend == "DOWN" and rsi_main <= 45:
-            trend_score += 5
-
-    # --- Momentum score ---
-    true_range = float(last_main["high"] - last_main["low"]) if not math.isnan(last_main["high"] - last_main["low"]) else 0.0
-    if atr_main > 0:
-        if true_range >= 0.8 * atr_main:
-            momentum_score += 10
-    vol_main = float(last_main["volume"])
-    if vol_ma20_main > 0 and vol_main >= 1.2 * vol_ma20_main:
-        momentum_score += 10
-
-    prev_highs = max(prev1_main["high"], prev2_main["high"])
-    prev_lows = min(prev1_main["low"], prev2_main["low"])
-    broke_high = last_main["high"] > prev_highs
-    broke_low = last_main["low"] < prev_lows
-
-    if trade_signal in ("LONG mạnh", "LONG hồi kỹ thuật") and broke_high:
-        momentum_score += 10
-    elif trade_signal in ("SHORT mạnh", "SHORT hồi kỹ thuật") and broke_low:
-        momentum_score += 10
-    elif broke_high or broke_low:
-        momentum_score += 5  # có phá range nhưng không khớp hẳn hướng trade
-
-    # Momentum từ MA5
-    if trade_signal in ("LONG mạnh", "LONG hồi kỹ thuật") and is_ma5_up:
-        momentum_score += 5
-    if trade_signal in ("SHORT mạnh", "SHORT hồi kỹ thuật") and is_ma5_down:
-        momentum_score += 5
-
-    # --- Location score ---
-    if atr_main > 0:
-        dist_ema20 = abs(float(last_main["close"] - last_main["ema20"]))
-        # càng gần EMA20 càng tốt
-        if dist_ema20 <= 0.7 * atr_main:
-            location_score += 15
-        elif dist_ema20 <= 1.0 * atr_main:
-            location_score += 8
-
-    # ưu tiên tín hiệu hồi kỹ thuật có vị trí đẹp (sau pha kéo/rơi mạnh)
-    if trade_signal in ("LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"):
-        location_score += 10
-
-    total = trend_score + momentum_score + location_score
-
-    # --- Điều chỉnh theo Trend Reliability Index ---
-    if tri_score >= 60:
-        total += 10
-    elif tri_score < 40:
-        total -= 10
-
-    # --- Điều chỉnh theo phiên giao dịch ---
-    if session_type == "ASIA" and trade_signal in ("LONG mạnh", "SHORT mạnh"):
-        # phiên Á trend thường yếu hơn
-        total -= 10
-
-    # --- Điều chỉnh theo nến "giống tin tức" ---
-    if news_like:
-        total -= 15
-
-    total = max(0, min(100, total))
-    return trend_score, momentum_score, location_score, total
+    n = network_id.lower().strip()
+    mapping = {
+        "eth": ("evm", "eth"),
+        "ethereum": ("evm", "eth"),
+        "bsc": ("evm", "bsc"),
+        "binance-smart-chain": ("evm", "bsc"),
+        "polygon_pos": ("evm", "polygon"),
+        "polygon": ("evm", "polygon"),
+        "arbitrum": ("evm", "arbitrum"),
+        "optimism": ("evm", "optimism"),
+        "base": ("evm", "base"),
+        "avalanche": ("evm", "avalanche"),
+        "solana": ("solana", "mainnet"),
+    }
+    return mapping.get(n, (None, None))
 
 
-# ========================
-#  Core analysis (MAIN TF = 30m)
-# ========================
+def resolve_symbol_auto(inst_id: str, resolve_cache: dict):
+    """
+    Tự resolve từ symbol OKX sang token onchain.
+    """
+    if inst_id in resolve_cache:
+        return resolve_cache[inst_id]
 
-def analyze_and_build_message() -> (str, str):
-    now_utc = datetime.now(timezone.utc)
-    session_type = get_session_type(now_utc)
+    symbol_base = clean_symbol_base(inst_id)
 
-    # 1) Lấy nến 30m (khung trade chính)
-    df30 = fetch_okx_candles(TIMEFRAMES["30m"], limit=200)
-    df30["ema20"] = ema(df30["close"], 20)
-    df30["ema50"] = ema(df30["close"], 50)
-    df30["atr14"] = calc_atr(df30, 14)
-    df30["rsi14"] = rsi(df30["close"], 14)
-    df30["vol_ma20"] = df30["volume"].rolling(window=20).mean()
-    # Momentum layer: MA5
-    df30["ma5"] = ema(df30["close"], 5)
-    df30["ma5_slope"] = df30["ma5"].diff()
+    coin_candidates = search_coingecko_coin_candidates(symbol_base)
+    onchain_candidates = search_coingecko_onchain_candidates(symbol_base)
 
-    last30 = df30.iloc[-1]
-    prev30_1 = df30.iloc[-2]
-    prev30_2 = df30.iloc[-3]
+    best_onchain = onchain_candidates[0] if onchain_candidates else None
+    best_coin = coin_candidates[0] if coin_candidates else None
 
-    atr_30 = float(last30["atr14"])
-    atr_text = classify_atr(atr_30)
-    rsi_30 = float(last30["rsi14"]) if not math.isnan(last30["rsi14"]) else float("nan")
-    prev_rsi_30 = float(df30["rsi14"].iloc[-2]) if not math.isnan(df30["rsi14"].iloc[-2]) else float("nan")
-    regime = detect_regime(rsi_30, atr_30)
-    trend_30 = detect_trend_from_ema(last30)
+    if not best_onchain:
+        result = {
+            "resolved": False,
+            "resolve_confidence": 0.0,
+            "reason": "no_onchain_candidate",
+            "coin_candidate": best_coin,
+            "onchain_candidate": None,
+            "chain_type": None,
+            "network": None,
+            "token_address": None,
+            "resolved_name": None,
+            "resolved_symbol": None,
+            "last_verified_at": utc_now_str(),
+        }
+        resolve_cache[inst_id] = result
+        return result
 
-    ma5_val = float(last30["ma5"]) if not math.isnan(last30["ma5"]) else float("nan")
-    ma5_slope = float(last30["ma5_slope"]) if not math.isnan(last30["ma5_slope"]) else 0.0
-    is_ma5_up = (ma5_slope > 0) and (not math.isnan(ma5_val)) and (last30["close"] > ma5_val)
-    is_ma5_down = (ma5_slope < 0) and (not math.isnan(ma5_val)) and (last30["close"] < ma5_val)
+    chain_type, moralis_network = network_to_moralis_chain(best_onchain.get("network"))
+    confidence = safe_float(best_onchain.get("score"), 0.0)
 
-    # Độ tuổi nến 30m (để tránh vào lệnh hồi quá trễ)
-    last30_ts = df30.index[-1]
-    frame_seconds_30 = 30 * 60
-    age_seconds_30 = max(0.0, (now_utc - last30_ts).total_seconds())
-    bar_age_ratio_30 = min(1.0, age_seconds_30 / frame_seconds_30)
+    if best_coin:
+        coin_sym = str(best_coin.get("symbol", "")).lower()
+        on_sym = str(best_onchain.get("token_symbol", "")).lower()
+        if coin_sym and on_sym and coin_sym == on_sym:
+            confidence += 10
 
-    # 1b) Lấy thêm khung 15m để phát hiện hồi kỹ thuật SỚM + news-like
-    df15 = fetch_okx_candles(TIMEFRAMES["15m"], limit=200)
-    df15["rsi14"] = rsi(df15["close"], 14)
-    df15["atr14"] = calc_atr(df15, 14)
-    last15 = df15.iloc[-1]
-    prev15_1 = df15.iloc[-2]
-    prev15_2 = df15.iloc[-3]
-    rsi_15 = float(last15["rsi14"]) if not math.isnan(last15["rsi14"]) else float("nan")
-    atr_15 = float(last15["atr14"]) if not math.isnan(last15["atr14"]) else float("nan")
+    resolved = (
+        confidence >= 80 and
+        best_onchain.get("token_address") and
+        chain_type is not None and
+        moralis_network is not None
+    )
 
-    # 2) Lấy nến higher TF & trend
-    tf_trends = {}
-    for name in ["30m", "1H", "2H", "4H"]:
-        if name == "30m":
-            df = df30
-        else:
-            df = fetch_okx_candles(TIMEFRAMES[name], limit=120)
-        df["ema20"] = ema(df["close"], 20)
-        df["ema50"] = ema(df["close"], 50)
-        tf_trends[name] = {
-            "trend": detect_trend_from_ema(df.iloc[-1]),
-            "close": float(df.iloc[-1]["close"]),
+    result = {
+        "resolved": resolved,
+        "resolve_confidence": round(confidence, 2),
+        "reason": "ok" if resolved else "low_confidence_or_unsupported_network",
+        "coin_candidate": best_coin,
+        "onchain_candidate": best_onchain,
+        "chain_type": chain_type,
+        "network": moralis_network,
+        "token_address": best_onchain.get("token_address"),
+        "resolved_name": best_onchain.get("token_name"),
+        "resolved_symbol": best_onchain.get("token_symbol"),
+        "last_verified_at": utc_now_str(),
+    }
+    resolve_cache[inst_id] = result
+    return result
+
+
+# =========================================================
+# MORALIS HOLDER
+# =========================================================
+def moralis_headers():
+    return {"X-API-Key": MORALIS_API_KEY} if MORALIS_API_KEY else {}
+
+
+def fetch_top10_holder_pct_evm(token_address: str, chain: str):
+    if not MORALIS_API_KEY:
+        return None
+    url = f"https://deep-index.moralis.io/api/v2.2/erc20/{token_address}/owners"
+    params = {"chain": chain, "order": "DESC", "limit": 10}
+    r = session.get(url, headers=moralis_headers(), params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    js = r.json()
+    result = js.get("result", []) or []
+
+    total_pct = 0.0
+    for owner in result[:10]:
+        total_pct += safe_float(owner.get("percentage_relative_to_total_supply"), 0.0)
+    return round(total_pct, 4)
+
+
+def fetch_top10_holder_pct_solana(token_address: str):
+    if not MORALIS_API_KEY:
+        return None
+    url = f"https://solana-gateway.moralis.io/token/mainnet/holders/{token_address}"
+    r = session.get(url, headers=moralis_headers(), timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    js = r.json()
+    top10 = js.get("holderSupply", {}).get("top10", {}).get("supplyPercent")
+    if top10 is None:
+        return None
+    return round(safe_float(top10), 4)
+
+
+def get_holder_info_from_resolve(resolved_info: dict):
+    if not resolved_info.get("resolved"):
+        return {
+            "top10_holder_pct": None,
+            "holder_flag": "UNRESOLVED",
+            "holder_score": 0.0,
+            "holder_note": resolved_info.get("reason", "unresolved"),
         }
 
-    # chọn trend chính: ưu tiên 4H, rồi 2H, 1H, 30m
-    main_trend = trend_30
-    for key in ["4H", "2H", "1H", "30m"]:
-        t = tf_trends.get(key, {}).get("trend")
-        if t in ["UP", "DOWN"]:
-            main_trend = t
-            break
+    if not MORALIS_API_KEY:
+        return {
+            "top10_holder_pct": None,
+            "holder_flag": "NO_HOLDER_API",
+            "holder_score": 0.0,
+            "holder_note": "missing moralis api key",
+        }
 
-    # 3) Market structure 30m (chính) & 15m (phụ)
-    ms_30m = classify_market_structure(df30)
-    ms_15m = classify_market_structure(df15)
+    chain_type = resolved_info.get("chain_type")
+    network = resolved_info.get("network")
+    token_address = resolved_info.get("token_address")
 
-    ms_30m_is_down = "Giảm" in ms_30m
-    ms_30m_is_up = "Tăng" in ms_30m
-    ms_15m_is_down = "Giảm" in ms_15m
-    ms_15m_is_up = "Tăng" in ms_15m
-
-    # BOS: phá swing high/low 30m
-    swing_highs_30, swing_lows_30 = _detect_swings(df30, lookback=80)
-    bos_up = False
-    bos_down = False
-    close_30 = float(last30["close"])
-    if swing_highs_30:
-        last_sh_price = swing_highs_30[-1][1]
-        if close_30 > last_sh_price * 1.001:  # phá swing high rõ ràng
-            bos_up = True
-    if swing_lows_30:
-        last_sl_price = swing_lows_30[-1][1]
-        if close_30 < last_sl_price * 0.999:  # phá swing low rõ ràng
-            bos_down = True
-
-    # 4) Exness alignment
-    okx_last_price = float(last30["close"])
-    exness_last = get_exness_price()
-    if exness_last is None:
-        diff = 0.0
-        exness_last = okx_last_price
-    else:
-        diff = exness_last - okx_last_price
-
-    # 5) Một số flag nến cho 30m
-    def is_bull(row):
-        return row["close"] > row["open"]
-
-    def is_bear(row):
-        return row["close"] < row["open"]
-
-    three_bull_30 = (
-        is_bull(last30) and is_bull(prev30_1) and is_bull(prev30_2)
-        and last30["close"] > prev30_1["close"] > prev30_2["close"]
-    )
-    three_bear_30 = (
-        is_bear(last30) and is_bear(prev30_1) and is_bear(prev30_2)
-        and last30["close"] < prev30_1["close"] < prev30_2["close"]
-    )
-
-    true_range_30 = last30["high"] - last30["low"]
-    big_move_30 = (not math.isnan(atr_30)) and (true_range_30 > 1.0 * atr_30)
-    moderate_move_30 = (not math.isnan(atr_30)) and (true_range_30 > 0.8 * atr_30)
-
-    vol_30 = float(last30["volume"])
-    vol_ma20_30 = float(last30["vol_ma20"]) if not math.isnan(last30["vol_ma20"]) else 0.0
-    vol_ok_30 = (vol_ma20_30 == 0) or (vol_30 > 1.1 * vol_ma20_30)
-
-    # 5b) Cờ cho 15m (phát hiện hồi sớm)
-    last3_15 = [last15, prev15_1, prev15_2]
-    bull_count_15 = sum(1 for r in last3_15 if is_bull(r))
-    bear_count_15 = sum(1 for r in last3_15 if is_bear(r))
-    change_15 = float(last15["close"] - prev15_2["close"])
-
-    # News-like bar (30m & 15m)
-    news_like = detect_news_like_bar(df30, atr_30, df15, atr_15)
-
-    # Trend Reliability Index cho khung 30m
-    tri_score, tri_desc = compute_trend_reliability(
-        main_trend=main_trend,
-        trend_main=trend_30,
-        ms_main=ms_30m,
-        ms_sub=ms_15m,
-        tf_trends=tf_trends,
-        last_main=last30,
-        atr_main=atr_30,
-        rsi_main=rsi_30,
-        vol_main=vol_30,
-        vol_ma20_main=vol_ma20_30,
-    )
-
-    # =========
-    #  Logic tín hiệu: LONG/SHORT MẠNH & HỒI KỸ THUẬT (khung 30m, early 15m)
-    # =========
-    force = "Trung lập"
-    signal = "Không rõ"
-    rsi_val = rsi_30
-
-    # chỉ cho phép gọi là "MẠNH" khi:
-    # - regime = TREND
-    # - ATR đủ lớn (>= 250)
-    # - market structure 30m & 15m cùng hướng
-    can_strong_short = (
-        main_trend == "DOWN"
-        and regime == "TREND"
-        and atr_30 >= 250
-        and ms_30m_is_down
-        and ms_15m_is_down
-    )
-
-    can_strong_long = (
-        main_trend == "UP"
-        and regime == "TREND"
-        and atr_30 >= 250
-        and ms_30m_is_up
-        and ms_15m_is_up
-    )
-
-    # ========== DOWN TREND ==========
-    if main_trend == "DOWN":
-        # kiểm tra rơi xa EMA20 để tránh short đuổi đáy
-        extended_down = False
-        if not math.isnan(atr_30):
-            dist_from_ema20 = last30["ema20"] - last30["close"]
-            extended_down = dist_from_ema20 > 0.8 * atr_30
-
-        # điều kiện HỒI KỸ THUẬT (30m)
-        strong_two_bull_30 = (
-            is_bull(last30)
-            and is_bull(prev30_1)
-            and ((last30["high"] - last30["low"]) > 0.8 * atr_30)
-            and ((prev30_1["high"] - prev30_1["low"]) > 0.8 * atr_30)
-            and vol_ok_30
-            and (not math.isnan(rsi_val) and rsi_val > 40)
-            and (not math.isnan(prev_rsi_30) and prev_rsi_30 < 35)
-        )
-        three_bull_retrace_30 = (
-            three_bull_30
-            and last30["close"] >= last30["ema20"]
-        )
-
-        # điều kiện HỒI KỸ THUẬT SỚM (15m)
-        early_long_retrace_15m = (
-            bull_count_15 >= 2
-            and not math.isnan(rsi_15)
-            and rsi_15 > 45
-            and (atr_30 > 0 and change_15 > 0.4 * atr_30)
-        )
-
-        is_tech_retrace_long = strong_two_bull_30 or three_bull_retrace_30 or early_long_retrace_15m
-
-        if is_tech_retrace_long:
-            if early_long_retrace_15m and not (strong_two_bull_30 or three_bull_retrace_30):
-                force = "Nhịp hồi kỹ thuật SỚM trong Downtrend (dựa trên khung 15m)."
-            else:
-                force = "Nhịp hồi kỹ thuật rõ ràng trong Downtrend (3 nến hoặc 2 nến 30m mạnh)."
-            signal = "LONG hồi kỹ thuật"
-
-        else:
-            # nếu không phải hồi rõ, xét SHORT mạnh nếu đủ điều kiện
-            if can_strong_short and is_bear(last30) and last30["close"] < last30["ema20"] < last30["ema50"] and big_move_30 and vol_ok_30:
-                if extended_down or (not math.isnan(rsi_val) and rsi_val < 25):
-                    force = "Giá đã rơi sâu xa EMA, dễ có nhịp hồi kỹ thuật"
-                    signal = "Chờ SHORT lại"
-                else:
-                    force = "Lực bán chiếm ưu thế, Downtrend mạnh (khung 30m)"
-                    signal = "SHORT mạnh"
-            else:
-                if extended_down or (not math.isnan(rsi_val) and rsi_val < 30):
-                    force = "Nhịp hồi/sideway sau pha rơi sâu – có thể đánh LONG hồi nhỏ"
-                    signal = "LONG hồi kỹ thuật"
-                else:
-                    force = "Thị trường đang nhiễu trong Downtrend yếu/sideway"
-                    signal = "Không rõ"
-
-    # ========== UP TREND ==========
-    elif main_trend == "UP":
-        # kiểm tra kéo xa EMA
-        extended_up = False
-        if not math.isnan(atr_30):
-            dist_from_ema20 = last30["close"] - last30["ema20"]
-            extended_up = dist_from_ema20 > 0.8 * atr_30
-
-        # điều kiện HỒI KỸ THUẬT (30m)
-        strong_two_bear_30 = (
-            is_bear(last30)
-            and is_bear(prev30_1)
-            and ((last30["high"] - last30["low"]) > 0.8 * atr_30)
-            and ((prev30_1["high"] - prev30_1["low"]) > 0.8 * atr_30)
-            and vol_ok_30
-            and (not math.isnan(rsi_val) and rsi_val < 60)
-            and (not math.isnan(prev_rsi_30) and prev_rsi_30 > 65)
-        )
-        three_bear_retrace_30 = (
-            three_bear_30
-            and last30["close"] <= last30["ema20"]
-        )
-
-        # điều kiện HỒI KỸ THUẬT SỚM (15m)
-        early_short_retrace_15m = (
-            bear_count_15 >= 2
-            and not math.isnan(rsi_15)
-            and rsi_15 < 55
-            and (atr_30 > 0 and -change_15 > 0.4 * atr_30)
-        )
-
-        is_tech_retrace_short = strong_two_bear_30 or three_bear_retrace_30 or early_short_retrace_15m
-
-        if is_tech_retrace_short:
-            if early_short_retrace_15m and not (strong_two_bear_30 or three_bear_retrace_30):
-                force = "Nhịp điều chỉnh giảm SỚM trong Uptrend (dựa trên khung 15m)."
-            else:
-                force = "Nhịp điều chỉnh giảm (hồi kỹ thuật) rõ ràng trong Uptrend (khung 30m)."
-            signal = "SHORT hồi kỹ thuật"
-
-        else:
-            # không phải hồi rõ -> xét LONG mạnh nếu đủ điều kiện
-            if can_strong_long and is_bull(last30) and last30["close"] > last30["ema20"] > last30["ema50"] and big_move_30 and vol_ok_30:
-                if extended_up or (not math.isnan(rsi_val) and rsi_val > 75):
-                    force = "Giá đã kéo xa EMA, dễ có nhịp điều chỉnh giảm"
-                    signal = "Chờ LONG lại"
-                else:
-                    force = "Lực mua chiếm ưu thế, Uptrend mạnh (khung 30m)"
-                    signal = "LONG mạnh"
-            else:
-                if extended_up or (not math.isnan(rsi_val) and rsi_val > 70):
-                    force = "Nhịp điều chỉnh/sideway sau pha tăng mạnh – có thể SHORT hồi nhỏ"
-                    signal = "SHORT hồi kỹ thuật"
-                else:
-                    force = "Thị trường đang nhiễu trong Uptrend yếu/sideway"
-                    signal = "Không rõ"
-
-    # ========== Không rõ trend (SIDE / MIXED) ==========
-    else:
-        force = "Thị trường sideway, không có xu hướng rõ trên khung lớn"
-        signal = "Không rõ"
-
-    # BOS override: nếu vừa phá cấu trúc thì ưu tiên báo đảo chiều, tránh gọi hồi kỹ thuật sai
-    if main_trend == "DOWN" and bos_up:
-        force = "Giá vừa phá swing high quan trọng trên 30m – có dấu hiệu đảo chiều từ Downtrend sang Uptrend, hạn chế coi đây là nhịp hồi kỹ thuật."
-        signal = "Không rõ"
-    elif main_trend == "UP" and bos_down:
-        force = "Giá vừa phá swing low quan trọng trên 30m – có dấu hiệu đảo chiều từ Uptrend sang Downtrend, hạn chế coi đây là nhịp hồi kỹ thuật."
-        signal = "Không rõ"
-
-    # 6) Khả năng hồi / điều chỉnh (EXNESS) dùng ATR 30m
-    if "LONG" in signal and "hồi" in signal:
-        retrace_info = get_retrace_zones("up", exness_last, atr_30)
-    elif "SHORT" in signal and "hồi" in signal:
-        retrace_info = get_retrace_zones("down", exness_last, atr_30)
-    elif signal == "Chờ SHORT lại":
-        retrace_info = get_retrace_zones("up", exness_last, atr_30)
-    elif signal == "Chờ LONG lại":
-        retrace_info = get_retrace_zones("down", exness_last, atr_30)
-    else:
-        retrace_info = {"direction": None, "zones": []}
-
-    # 7) Gợi ý lệnh: map signal hiển thị -> trade_signal thực sự
-    trade_signal: Optional[str] = None
-    if signal in ["SHORT mạnh", "LONG mạnh", "LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"]:
-        trade_signal = signal
-    elif signal == "Chờ SHORT lại":
-        trade_signal = "LONG hồi kỹ thuật"
-    elif signal == "Chờ LONG lại":
-        trade_signal = "SHORT hồi kỹ thuật"
-
-    # Bảo vệ: nếu là hồi kỹ thuật nhưng nến 30m đã chạy > 70% thời gian
-    late_retrace = False
-    if trade_signal in ["LONG hồi kỹ thuật", "SHORT hồi kỹ thuật"] and bar_age_ratio_30 > 0.7:
-        late_retrace = True
-        force += " – Nhịp hồi đã đi được phần lớn cây nến 30m, hạn chế vào lệnh mới (tránh vào trễ)."
-
-    # 7b) Tính Signal Score (trend/momentum/location + TRI + phiên + news)
-    trend_score = momentum_score = location_score = total_score = 0
-    if trade_signal is not None:
-        trend_score, momentum_score, location_score, total_score = compute_signal_score(
-            main_trend=main_trend,
-            trend_main=trend_30,
-            ms_main=ms_30m,
-            ms_sub=ms_15m,
-            rsi_main=rsi_30,
-            atr_main=atr_30,
-            last_main=last30,
-            prev1_main=prev30_1,
-            prev2_main=prev30_2,
-            vol_ma20_main=vol_ma20_30,
-            trade_signal=trade_signal,
-            is_ma5_up=is_ma5_up,
-            is_ma5_down=is_ma5_down,
-            tri_score=tri_score,
-            session_type=session_type,
-            news_like=news_like,
-        )
-
-    # 7c) Gating: chỉ tạo lệnh khi score >= 60 và không bị late_retrace
-    trade: Optional[Dict[str, Any]] = None
-    score_comment = ""
-    if trade_signal is not None and not late_retrace and total_score >= 60:
-        trade = build_trade_suggestion(trade_signal, last30, atr_30)
-        if total_score < 75:
-            score_comment = (
-                f"Điểm chất lượng tín hiệu: {total_score}/100 "
-                f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
-                f"*tín hiệu KHÁ*, nên vào size vừa phải."
-            )
-        else:
-            score_comment = (
-                f"Điểm chất lượng tín hiệu: {total_score}/100 "
-                f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
-                f"*tín hiệu MẠNH*, có thể cân nhắc vào lệnh chuẩn size."
-            )
-    elif trade_signal is not None and not late_retrace and total_score < 60:
-        score_comment = (
-            f"Điểm chất lượng tín hiệu: {total_score}/100 "
-            f"(Trend: {trend_score}, Momentum: {momentum_score}, Vị trí: {location_score}) – "
-            f"*dưới ngưỡng 60*, ưu tiên QUAN SÁT (NO TRADE)."
-        )
-
-    # 8) Build message
-    now_str = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    msg_lines: List[str] = []
-    msg_lines.append("✅✅✅ *BTC UPDATE INFO (BTC-USDT)*")
-    msg_lines.append(f"Tín hiệu: {signal}")
-    if score_comment:
-        msg_lines.append(f"- {score_comment}") 
-    msg_lines.append(f"Thời gian: `{now_str}`")
-    msg_lines.append(f"Giá EXNESS: {exness_last:,.2f} (lệch {diff:+.2f})")
-    msg_lines.append("")
-    msg_lines.append("*Trend higher timeframe:*")
-    msg_lines.append(f"- Trend 30m: {tf_trends['30m']['trend']} (Close: {tf_trends['30m']['close']:,.2f})")
-    msg_lines.append(f"- 1H: {tf_trends['1H']['trend']} (Close: {tf_trends['1H']['close']:,.2f})")
-    msg_lines.append(f"- 2H: {tf_trends['2H']['trend']} (Close: {tf_trends['2H']['close']:,.2f})")
-    msg_lines.append(f"- 4H: {tf_trends['4H']['trend']} (Close: {tf_trends['4H']['close']:,.2f})")
-    msg_lines.append(f"→ *Trend chính (ưu tiên 4H)*: {main_trend}")
-    msg_lines.append(f"→ Trend Reliability Index (TRI): {tri_score}/100 – {tri_desc}")
-    msg_lines.append("")
-    msg_lines.append("*Market structure:*")
-    msg_lines.append(f"- 15m: {ms_15m}")
-    msg_lines.append(f"- 30m: {ms_30m}  *(khung trade chính)*")
-    msg_lines.append("")
-    msg_lines.append("*Khung 30m (khung trade chính):*")
-    msg_lines.append(f"- Xu hướng EMA 30m: {trend_30}")
-    msg_lines.append(f"- {force}")
-    msg_lines.append(f"- ATR14 30m: {atr_30:.2f}")
-    msg_lines.append(f"  → {atr_text}")
-    if not math.isnan(rsi_30):
-        msg_lines.append(f"- RSI14 30m: {rsi_30:.1f} – Chế độ thị trường: {regime}")
-    if news_like:
-        msg_lines.append("⚠ Có nến biến động >3×ATR (giống nến tin tức) trong 1–2 nến gần đây (30m hoặc 15m) – nên cẩn trọng với tín hiệu.")
-    msg_lines.append("")
-    msg_lines.append(f"- {get_session_note(now_utc)}")
-    #msg_lines.append(f"- Phiên hiện tại: {session_type}")
-    msg_lines.append("")
-
-    if retrace_info["zones"]:
-        if retrace_info["direction"] == "up":
-            msg_lines.append("*📌 Khả năng hồi lên các vùng (EXNESS – ATR 30m):*")
-        else:
-            msg_lines.append("*📌 Khả năng điều chỉnh về các vùng (EXNESS – ATR 30m):*")
-        for label, z_low, z_high in retrace_info["zones"]:
-            msg_lines.append(f"• {label}: {z_low:,.2f} – {z_high:,.2f}")
-        msg_lines.append("")
-
-    if trade:
-        ex_entry = to_exness_price(trade["entry"], diff)
-        ex_tp = to_exness_price(trade["tp"], diff)
-        ex_sl = to_exness_price(trade["sl"], diff)
-
-        msg_lines.append("🎯 *Gợi ý lệnh (30m – trend & hồi kỹ thuật):*")
-        msg_lines.append(f"- Lệnh: *{trade['side']}* ({trade_signal})")
-        #msg_lines.append("")
-        #msg_lines.append(f"- Entry OKX: {trade['entry']:,.1f}")
-        #msg_lines.append(f"- TP OKX: {trade['tp']:,.1f}")
-        #msg_lines.append(f"- SL OKX: {trade['sl']:,.1f}")
-        msg_lines.append("")
-        msg_lines.append(f"- Entry EXNESS: {ex_entry:,.1f}")
-        msg_lines.append(f"- TP EXNESS: {ex_tp:,.1f}")
-        msg_lines.append(f"- SL EXNESS: {ex_sl:,.1f}")
-    else:
-        if "NO TRADE" in score_comment or "quan sát" in score_comment:
-            msg_lines.append("⚠ Dù có tín hiệu, *điểm chất lượng thấp* hoặc bối cảnh nhiễu nên ưu tiên QUAN SÁT, chưa gợi ý lệnh cụ thể.")
-        else:
-            msg_lines.append("⚠ Hiện tín hiệu chưa đủ rõ để gợi ý lệnh (NO TRADE hoặc tránh vào trễ).")
-
-    # === TẠO state_key cho logic chống spam ===
-    state_parts = [
-        main_trend,
-        ms_30m,
-        ms_15m,
-        trend_30,
-        force,
-        signal,
-        regime,
-        atr_text,
-        session_type,
-        int(tri_score / 10),
-        int(trend_score / 5),
-        int(momentum_score / 5),
-        int(location_score / 5),
-        int(news_like),
-    ]
-
-    if trade:
-        state_parts += [
-            trade_signal,
-            trade["side"],
-            round(trade["entry"] / 10) * 10,
-            round(trade["tp"] / 10) * 10,
-            round(trade["sl"] / 10) * 10,
-        ]
-
-    state_key = "|".join(map(str, state_parts))
-
-    return "\n".join(msg_lines), state_key
-
-
-def main():
-    _log("Start BTC analyzer bot (MAIN TF = 30m)...")
-
-    # build message + state_key
     try:
-        text, state_key = analyze_and_build_message()
+        if chain_type == "evm":
+            top10_pct = fetch_top10_holder_pct_evm(token_address, network)
+        elif chain_type == "solana":
+            top10_pct = fetch_top10_holder_pct_solana(token_address)
+        else:
+            top10_pct = None
     except Exception as e:
-        _log(f"Analyze error: {e}")
+        return {
+            "top10_holder_pct": None,
+            "holder_flag": "ERR",
+            "holder_score": 0.0,
+            "holder_note": str(e)[:120],
+        }
+
+    if top10_pct is None:
+        return {
+            "top10_holder_pct": None,
+            "holder_flag": "NA",
+            "holder_score": 0.0,
+            "holder_note": "holder unavailable",
+        }
+
+    if top10_pct >= 85:
+        flag = "VERY_HIGH"
+        score = 3.0
+    elif top10_pct >= 80:
+        flag = "HIGH_80"
+        score = 2.5
+    elif top10_pct >= 70:
+        flag = "HIGH"
+        score = 2.0
+    elif top10_pct >= 50:
+        flag = "MID"
+        score = 1.0
+    else:
+        flag = "LOW"
+        score = 0.0
+
+    return {
+        "top10_holder_pct": round(top10_pct, 4),
+        "holder_flag": flag,
+        "holder_score": score,
+        "holder_note": "",
+    }
+
+
+# =========================================================
+# TRACKING
+# =========================================================
+TRACKING_COLUMNS = [
+    "symbol",
+    "first_seen_at",
+    "last_seen_at",
+    "days_tracking",
+    "status_first",
+    "status_current",
+    "last_status_change_at",
+    "price_first",
+    "price_last",
+    "performance_pct",
+    "top10_holder_pct",
+    "holder_flag",
+    "resolve_confidence",
+    "hunter_priority",
+    "score_peak",
+    "score_last",
+    "seen_count",
+    "note"
+]
+
+
+def load_tracking_df(sh):
+    ws = get_or_create_ws(sh, "TRACKING_90D", rows=6000, cols=40)
+    df = worksheet_to_df(ws)
+    if df.empty:
+        return pd.DataFrame(columns=TRACKING_COLUMNS)
+    for c in TRACKING_COLUMNS:
+        if c not in df.columns:
+            df[c] = ""
+    return df[TRACKING_COLUMNS]
+
+
+def upsert_tracking(old_tracking_df: pd.DataFrame, current_df: pd.DataFrame):
+    now_s = utc_now_str()
+    today = utc_now().date()
+
+    tracking_map = {}
+    if not old_tracking_df.empty:
+        for _, r in old_tracking_df.iterrows():
+            tracking_map[str(r["symbol"]).strip()] = dict(r)
+
+    for _, r in current_df.iterrows():
+        sym = str(r["symbol"]).strip()
+        if not sym:
+            continue
+
+        price = safe_float(r["price"], 0.0)
+        status = str(r["status"])
+        score = safe_float(r["score"], 0.0)
+        holder_pct = r.get("top10_holder_pct")
+        holder_flag = r.get("holder_flag", "")
+        priority = r.get("hunter_priority", "")
+        resolve_conf = safe_float(r.get("resolve_confidence"), 0.0)
+
+        if sym not in tracking_map:
+            tracking_map[sym] = {
+                "symbol": sym,
+                "first_seen_at": now_s,
+                "last_seen_at": now_s,
+                "days_tracking": "0",
+                "status_first": status,
+                "status_current": status,
+                "last_status_change_at": now_s,
+                "price_first": str(price),
+                "price_last": str(price),
+                "performance_pct": "0",
+                "top10_holder_pct": "" if holder_pct is None else str(holder_pct),
+                "holder_flag": holder_flag,
+                "resolve_confidence": str(resolve_conf),
+                "hunter_priority": priority,
+                "score_peak": str(score),
+                "score_last": str(score),
+                "seen_count": "1",
+                "note": ""
+            }
+        else:
+            item = tracking_map[sym]
+            first_seen_raw = item.get("first_seen_at", now_s)
+            try:
+                first_seen_dt = datetime.strptime(first_seen_raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            except Exception:
+                first_seen_dt = utc_now()
+
+            item["last_seen_at"] = now_s
+            item["days_tracking"] = str((today - first_seen_dt.date()).days)
+
+            prev_status = str(item.get("status_current", "")).strip()
+            if prev_status != status:
+                item["last_status_change_at"] = now_s
+
+            item["status_current"] = status
+            item["price_last"] = str(price)
+
+            price_first = safe_float(item.get("price_first", 0.0), 0.0)
+            perf = ((price / (price_first + 1e-9)) - 1.0) * 100 if price_first > 0 else 0.0
+            item["performance_pct"] = str(round(perf, 2))
+
+            old_peak = safe_float(item.get("score_peak", 0.0), 0.0)
+            item["score_peak"] = str(max(old_peak, score))
+            item["score_last"] = str(score)
+            item["hunter_priority"] = priority
+            item["holder_flag"] = holder_flag
+            item["resolve_confidence"] = str(resolve_conf)
+
+            if holder_pct is not None:
+                item["top10_holder_pct"] = str(holder_pct)
+
+            old_count = int(float(item.get("seen_count", "0") or 0))
+            item["seen_count"] = str(old_count + 1)
+
+    out = pd.DataFrame(list(tracking_map.values()))
+    for c in TRACKING_COLUMNS:
+        if c not in out.columns:
+            out[c] = ""
+
+    out = out[TRACKING_COLUMNS].copy()
+    out["days_tracking_num"] = out["days_tracking"].apply(lambda x: safe_float(x, 9999))
+    out = out[out["days_tracking_num"] <= TRACKING_MAX_DAYS].copy()
+    out = out.drop(columns=["days_tracking_num"])
+    return out
+
+
+# =========================================================
+# LOG HELPERS
+# =========================================================
+def build_alert_log_rows(old_tracking_df: pd.DataFrame, current_df: pd.DataFrame):
+    rows = []
+    now_s = utc_now_str()
+
+    old_map = {}
+    if not old_tracking_df.empty:
+        for _, r in old_tracking_df.iterrows():
+            old_map[str(r["symbol"]).strip()] = dict(r)
+
+    for _, r in current_df.iterrows():
+        sym = str(r["symbol"]).strip()
+        new_status = str(r["status"])
+        score = r["score"]
+        top10 = r.get("top10_holder_pct")
+        old = old_map.get(sym)
+
+        if old is None:
+            rows.append([now_s, sym, "NEW", new_status, str(score), "" if pd.isna(top10) else str(top10), "first seen"])
+        else:
+            old_status = str(old.get("status_current", "")).strip()
+            if old_status != new_status:
+                rows.append([now_s, sym, old_status, new_status, str(score), "" if pd.isna(top10) else str(top10), "status changed"])
+    return rows
+
+
+def build_snapshot_rows(current_df: pd.DataFrame):
+    now_s = utc_now_str()
+    rows = []
+    for _, r in current_df.iterrows():
+        rows.append([
+            now_s,
+            r["symbol"],
+            r["price"],
+            r["status"],
+            r["hunter_priority"],
+            r["score"],
+            r["vol_ratio"],
+            r["compression"],
+            r["break_pressure"],
+            "" if pd.isna(r["top10_holder_pct"]) else r["top10_holder_pct"],
+            r["holder_flag"],
+            r["resolve_confidence"],
+        ])
+    return rows
+
+
+def build_resolve_cache_df(resolve_cache: dict):
+    rows = []
+    for symbol, info in resolve_cache.items():
+        on = info.get("onchain_candidate") or {}
+        coin = info.get("coin_candidate") or {}
+        rows.append({
+            "symbol": symbol,
+            "resolved": info.get("resolved"),
+            "resolve_confidence": info.get("resolve_confidence"),
+            "reason": info.get("reason"),
+            "chain_type": info.get("chain_type"),
+            "network": info.get("network"),
+            "token_address": info.get("token_address"),
+            "resolved_symbol": info.get("resolved_symbol"),
+            "resolved_name": info.get("resolved_name"),
+            "cg_coin_id": coin.get("id"),
+            "cg_coin_symbol": coin.get("symbol"),
+            "cg_coin_name": coin.get("name"),
+            "pool_address": on.get("pool_address"),
+            "reserve_usd": on.get("reserve_usd"),
+            "volume_usd_h24": on.get("volume_usd_h24"),
+            "last_verified_at": info.get("last_verified_at"),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_unresolved_queue_df(current_df: pd.DataFrame):
+    df = current_df.copy()
+    df = df[df["holder_flag"].isin(["UNRESOLVED"])].copy()
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "status", "score", "resolve_confidence", "holder_note"
+        ])
+    return df[["symbol", "status", "score", "resolve_confidence", "holder_note"]].sort_values(
+        ["score", "resolve_confidence"], ascending=[False, False]
+    )
+
+
+# =========================================================
+# ALERT LOGIC
+# =========================================================
+def should_alert(row):
+    status = row["status"]
+    score = row["score"]
+    top10 = row.get("top10_holder_pct")
+
+    if status == "PRE_BREAK" and score >= ALERT_MIN_SCORE_PREBREAK:
+        return True
+    if status == "EARLY_FLOW" and score >= ALERT_MIN_SCORE_EARLY:
+        return True
+    if status == "BREAKOUT" and score >= ALERT_MIN_SCORE_BREAKOUT:
+        return True
+    if top10 is not None and safe_float(top10) >= 80 and status in ["EARLY_FLOW", "PRE_BREAK", "BREAKOUT", "PUMPING"]:
+        return True
+    return False
+
+
+def format_alert(row):
+    holder_txt = "N/A" if pd.isna(row["top10_holder_pct"]) else f"{row['top10_holder_pct']}%"
+    return (
+        "🔥 <b>SPOT GEM ALERT</b>\n\n"
+        f"📌 {row['symbol']}\n"
+        f"💰 Price: {row['price']}\n\n"
+        f"🧭 Status: {row['status']}\n"
+        f"📊 Score: {row['score']}\n"
+        f"🎯 Priority: {row['hunter_priority']}\n\n"
+        f"📈 Vol Ratio: {row['vol_ratio']}\n"
+        f"🧱 Compression: {row['compression']}\n"
+        f"🚀 Break Pressure: {row['break_pressure']}\n"
+        f"🐋 Top10 Holder: {holder_txt}\n"
+        f"🔎 Resolve Confidence: {row['resolve_confidence']}\n"
+        f"🏷 Holder Flag: {row['holder_flag']}\n"
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def run():
+    print("🚀 START OKX SPOT HUNTER V4")
+    sent = cleanup_sent(load_sent())
+    resolve_cache = json_load_file("resolve_cache.json", {})
+
+    sh = init_sheet()
+
+    print("📡 Fetching OKX spot tickers...")
+    tickers = fetch_okx_spot_tickers()
+
+    base_rows = []
+    for t in tickers:
+        inst_id = str(t.get("instId", "")).strip()
+        if not inst_id:
+            continue
+        if ONLY_USDT_QUOTE and not inst_id.endswith("-USDT"):
+            continue
+
+        last_price = safe_float(t.get("last"), 0.0)
+        if last_price <= 0 or last_price >= PRICE_MAX:
+            continue
+
+        try:
+            candles = fetch_okx_candles(inst_id)
+            f = calc_features(candles)
+            status = classify_status(f)
+            score = calc_score(f, status, holder_score=0.0)
+            priority = calc_priority(status, score)
+
+            row = {
+                "symbol": inst_id,
+                "price": round(last_price, 8),
+                "status": status,
+                "hunter_priority": priority,
+                "score": score,
+                "vol_ratio": None if not f else round(f["vol_ratio"], 4),
+                "compression": None if not f else round(f["compression"], 4),
+                "higher_low": None if not f else f["higher_low"],
+                "break_pressure": None if not f else round(f["break_pressure"], 4),
+                "roc_10_pct": None if not f else round(f["roc_10"] * 100, 2),
+                "roc_20_pct": None if not f else round(f["roc_20"] * 100, 2),
+                "pos_in_range_pct": None if not f else round(f["pos_in_range"] * 100, 2),
+                "top10_holder_pct": None,
+                "holder_flag": "NOT_CHECKED",
+                "holder_score": 0.0,
+                "holder_note": "",
+                "resolve_confidence": 0.0,
+                "chain_type": None,
+                "network": None,
+                "token_address": None,
+                "resolved_name": None,
+                "resolved_symbol": None,
+                "time": utc_now_str(),
+            }
+            base_rows.append(row)
+            time.sleep(SLEEP_BETWEEN_SYMBOLS)
+
+        except Exception as e:
+            base_rows.append({
+                "symbol": inst_id,
+                "price": round(last_price, 8),
+                "status": "ERR",
+                "hunter_priority": "AVOID",
+                "score": 0.0,
+                "vol_ratio": None,
+                "compression": None,
+                "higher_low": None,
+                "break_pressure": None,
+                "roc_10_pct": None,
+                "roc_20_pct": None,
+                "pos_in_range_pct": None,
+                "top10_holder_pct": None,
+                "holder_flag": "ERR",
+                "holder_score": 0.0,
+                "holder_note": str(e)[:150],
+                "resolve_confidence": 0.0,
+                "chain_type": None,
+                "network": None,
+                "token_address": None,
+                "resolved_name": None,
+                "resolved_symbol": None,
+                "time": utc_now_str(),
+            })
+
+    df = pd.DataFrame(base_rows)
+    if df.empty:
+        print("❌ No rows.")
         return
-        
-    # ⛔ Nếu tín hiệu là "Không rõ" thì bỏ qua, không gửi Telegram
-    # (dựa vào dòng "- *Tín hiệu:* Không rõ" trong message)
-    if "Tín hiệu:* Không rõ" in text or "Tín hiệu: Không rõ" in text:
-        _log("Signal = 'Không rõ' -> skip Telegram để tránh spam.")
-        return
-    # connect sheet for anti-spam
-    try:
-        sh = connect_gsheet()
-        ws_cache = get_or_create_worksheet(sh, "BT_CACHE_BTC", rows=10, cols=2)
-    except Exception as e:
-        _log(f"Google Sheet error: {e}")
-        ws_cache = None
 
-    new_hash = compute_message_hash(state_key)
-    old_hash = None
-    if ws_cache is not None:
-        old_hash = sheet_read_last_message_hash(ws_cache)
+    # sort trước, rồi chỉ enrich holder cho nhóm đáng chú ý
+    df = df.sort_values(["score"], ascending=[False]).reset_index(drop=True)
 
-    if old_hash == new_hash:
-        _log("State unchanged from last run -> skip Telegram (avoid spam).")
-        return
+    resolve_mask = (
+        df["status"].isin(RESOLVE_STATUS_SET) |
+        (df.index < RESOLVE_TOP_N)
+    )
 
-    send_telegram_message(text)
-    _log("Message sent to Telegram.")
+    for idx in df[resolve_mask].index.tolist():
+        symbol = df.at[idx, "symbol"]
+        try:
+            resolved_info = resolve_symbol_auto(symbol, resolve_cache)
 
-    if ws_cache is not None:
-        sheet_write_last_message_hash(ws_cache, new_hash)
-        _log("Updated state hash in BT_CACHE_BTC.")
+            df.at[idx, "resolve_confidence"] = resolved_info.get("resolve_confidence", 0.0)
+            df.at[idx, "chain_type"] = resolved_info.get("chain_type")
+            df.at[idx, "network"] = resolved_info.get("network")
+            df.at[idx, "token_address"] = resolved_info.get("token_address")
+            df.at[idx, "resolved_name"] = resolved_info.get("resolved_name")
+            df.at[idx, "resolved_symbol"] = resolved_info.get("resolved_symbol")
+
+            holder_info = get_holder_info_from_resolve(resolved_info)
+            df.at[idx, "top10_holder_pct"] = holder_info["top10_holder_pct"]
+            df.at[idx, "holder_flag"] = holder_info["holder_flag"]
+            df.at[idx, "holder_score"] = holder_info["holder_score"]
+            df.at[idx, "holder_note"] = holder_info["holder_note"]
+
+            # recalc score sau khi có holder score
+            holder_score = safe_float(holder_info["holder_score"], 0.0)
+
+            f_fake = {
+                "vol_ratio": safe_float(df.at[idx, "vol_ratio"], 0.0),
+                "compression": safe_float(df.at[idx, "compression"], 1.0),
+                "higher_low": str(df.at[idx, "higher_low"]).lower() == "true",
+                "break_pressure": safe_float(df.at[idx, "break_pressure"], 0.0),
+                "roc_10": safe_float(df.at[idx, "roc_10_pct"], 0.0) / 100.0,
+            }
+            new_score = calc_score(f_fake, df.at[idx, "status"], holder_score=holder_score)
+            df.at[idx, "score"] = new_score
+            df.at[idx, "hunter_priority"] = calc_priority(df.at[idx, "status"], new_score)
+
+        except Exception as e:
+            df.at[idx, "holder_flag"] = "ERR"
+            df.at[idx, "holder_note"] = str(e)[:150]
+
+    # final sort
+    df = df.sort_values(["score", "top10_holder_pct"], ascending=[False, False], na_position="last").reset_index(drop=True)
+
+    # anti-spam telegram
+    for _, row in df.iterrows():
+        key = f"{row['symbol']}_{row['status']}"
+        if should_alert(row) and key not in sent:
+            send_telegram(format_alert(row))
+            sent[key] = {"time": utc_now().isoformat()}
+    save_sent(sent)
+    json_save_file("resolve_cache.json", resolve_cache)
+
+    # sheet: HUNTER_BOARD
+    ws_board = get_or_create_ws(sh, "HUNTER_BOARD", rows=6000, cols=40)
+    overwrite_worksheet(ws_board, df)
+
+    # sheet: TRACKING_90D
+    old_tracking_df = load_tracking_df(sh)
+    new_tracking_df = upsert_tracking(old_tracking_df, df)
+    ws_tracking = get_or_create_ws(sh, "TRACKING_90D", rows=6000, cols=40)
+    overwrite_worksheet(ws_tracking, new_tracking_df)
+
+    # sheet: ALERT_LOG
+    ws_alert = get_or_create_ws(sh, "ALERT_LOG", rows=20000, cols=20)
+    if ws_alert.get_all_values() == []:
+        ws_alert.update([["time", "symbol", "old_status", "new_status", "score", "top10_holder_pct", "note"]])
+    append_rows(ws_alert, build_alert_log_rows(old_tracking_df, df))
+
+    # sheet: SNAPSHOT_LOG
+    ws_snap = get_or_create_ws(sh, "SNAPSHOT_LOG", rows=50000, cols=20)
+    if ws_snap.get_all_values() == []:
+        ws_snap.update([[
+            "time", "symbol", "price", "status", "hunter_priority",
+            "score", "vol_ratio", "compression", "break_pressure",
+            "top10_holder_pct", "holder_flag", "resolve_confidence"
+        ]])
+    append_rows(ws_snap, build_snapshot_rows(df))
+
+    # sheet: RESOLVE_CACHE
+    ws_resolve = get_or_create_ws(sh, "RESOLVE_CACHE", rows=5000, cols=30)
+    overwrite_worksheet(ws_resolve, build_resolve_cache_df(resolve_cache))
+
+    # sheet: UNRESOLVED_QUEUE
+    ws_unresolved = get_or_create_ws(sh, "UNRESOLVED_QUEUE", rows=3000, cols=20)
+    overwrite_worksheet(ws_unresolved, build_unresolved_queue_df(df))
+
+    # summary telegram
+    top_df = df[df["status"].isin(["EARLY_FLOW", "PRE_BREAK", "BREAKOUT", "PUMPING"])].head(10)
+    if not top_df.empty:
+        lines = ["📊 <b>TOP HUNTER BOARD</b>", ""]
+        for _, r in top_df.iterrows():
+            holder_txt = "N/A" if pd.isna(r["top10_holder_pct"]) else f"{r['top10_holder_pct']}%"
+            lines.append(
+                f"• <b>{r['symbol']}</b> | {r['status']} | Score {r['score']} | Holder {holder_txt} | Resolve {r['resolve_confidence']}"
+            )
+        send_telegram("\n".join(lines))
+
+    print("✅ DONE")
+    print(df.head(20).to_string(index=False))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        run()
+    except Exception:
+        print("❌ FATAL ERROR")
+        traceback.print_exc()
