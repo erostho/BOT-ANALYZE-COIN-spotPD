@@ -94,20 +94,30 @@ def json_save_file(path, data):
 # =========================================================
 # GOOGLE SHEETS
 # =========================================================
+
+
 def init_sheet():
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive"
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDS_FILE, scope)
+
+    google_creds_raw = os.getenv("GOOGLE_CREDS_FILE", "")
+
+    if google_creds_raw.strip().startswith("{"):
+        creds_dict = json.loads(google_creds_raw)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    else:
+        creds = ServiceAccountCredentials.from_json_keyfile_name(google_creds_raw, scope)
+
     client = gspread.authorize(creds)
 
     try:
-        sh = client.open(SHEET_NAME)
+        sh = client.open(os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER"))
     except Exception:
-        sh = client.create(SHEET_NAME)
-    return sh
+        sh = client.create(os.getenv("SHEET_NAME", "OKX_SPOT_HUNTER"))
 
+    return sh
 
 def get_or_create_ws(sh, title, rows=3000, cols=40):
     try:
