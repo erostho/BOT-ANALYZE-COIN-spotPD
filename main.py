@@ -71,8 +71,21 @@ def safe_float(x, default=0.0):
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+def safe_holder_pct(pct):
+    try:
+        pct = float(pct)
+    except:
+        return None
 
+    # dữ liệu lỗi
+    if pct < 0:
+        return None
 
+    # clamp về max 100%
+    if pct > 100:
+        return 100.0
+
+    return pct
 def clean_symbol_base(inst_id: str) -> str:
     # RAVE-USDT -> RAVE
     return inst_id.split("-")[0].strip().lower()
@@ -606,8 +619,32 @@ def fetch_top10_holder_pct_evm(token_address: str, chain: str):
     result = js.get("result", []) or []
 
     total_pct = 0.0
-    for owner in result[:10]:
-        total_pct += safe_float(owner.get("percentage_relative_to_total_supply"), 0.0)
+    seen = set()
+    
+    for owner in result[:20]:  # lấy rộng hơn để tránh duplicate
+        addr = owner.get("owner_address")
+    
+        # tránh cộng trùng ví
+        if addr in seen:
+            continue
+        seen.add(addr)
+    
+        pct = safe_holder_pct(owner.get("percentage_relative_to_total_supply"))
+    
+        if pct is None:
+            continue
+    
+        total_pct += pct
+    
+        # chỉ lấy top 10 holder hợp lệ
+        if len(seen) >= 10:
+            break
+    
+    # clamp lần cuối
+    if total_pct > 100:
+        total_pct = 100.0
+    
+    return round(total_pct, 4)
     return round(total_pct, 4)
 
 
@@ -1068,7 +1105,36 @@ def should_alert(row):
         )
 
     return False
+def is_valid_candidate(row):
+    price = safe_float(row.get("price"), 0)
+    symbol = str(row.get("symbol", ""))
+    resolve = safe_float(row.get("resolve_confidence"), 0)
+    vol = safe_float(row.get("vol_ratio"), 0)
+    comp = safe_float(row.get("compression"), 1)
+    holder = safe_float(row.get("top10_holder_pct"), 0)
 
+    # ❌ 1. Loại stablecoin (giá ~1)
+    if 0.95 <= price <= 1.05:
+        return False
+
+    # ❌ 2. Resolve quá thấp (map không chắc)
+    if resolve < 60:
+        return False
+
+    # ❌ 3. Không có volume thật
+    if vol < 1.2:
+        return False
+
+    # ❌ 4. Không có nén (không phải setup)
+    if comp > 0.85:
+        return False
+
+    # ❌ 5. Holder lỗi (quá vô lý)
+    if holder > 100:
+        return False
+
+    return True
+    
 def format_alert(row):
     holder_txt = "N/A" if pd.isna(row["top10_holder_pct"]) else f"{row['top10_holder_pct']}%"
     return (
@@ -1258,7 +1324,7 @@ def run():
     for _, row in df.iterrows():
         key = f"{row['symbol']}_{row['status']}"
     
-        if should_alert(row) and key not in sent:
+        if should_alert(row) and is_valid_candidate(row) and key not in sent:
             alert_rows.append(row.to_dict())
             sent[key] = {"time": utc_now().isoformat()}
     if alert_rows:
