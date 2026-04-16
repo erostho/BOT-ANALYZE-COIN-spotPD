@@ -893,20 +893,34 @@ def build_unresolved_queue_df(current_df: pd.DataFrame):
 # ALERT LOGIC
 # =========================================================
 def should_alert(row):
-    status = row["status"]
-    score = row["score"]
-    top10 = row.get("top10_holder_pct")
+    status = str(row.get("status", ""))
+    score = safe_float(row.get("score"), 0.0)
+    vol_ratio = safe_float(row.get("vol_ratio"), 0.0)
+    compression = safe_float(row.get("compression"), 99.0)
+    break_pressure = safe_float(row.get("break_pressure"), 0.0)
+    roc_10_pct = safe_float(row.get("roc_10_pct"), 0.0)
 
-    if status == "PRE_BREAK" and score >= ALERT_MIN_SCORE_PREBREAK:
-        return True
-    if status == "EARLY_FLOW" and score >= ALERT_MIN_SCORE_EARLY:
-        return True
-    if status == "BREAKOUT" and score >= ALERT_MIN_SCORE_BREAKOUT:
-        return True
-    if top10 is not None and safe_float(top10) >= 80 and status in ["EARLY_FLOW", "PRE_BREAK", "BREAKOUT", "PUMPING"]:
-        return True
+    # 1) Chỉ ưu tiên coin "sắp chạy"
+    if status == "PRE_BREAK":
+        if (
+            score >= 8.0 and
+            vol_ratio >= 1.35 and
+            compression <= 0.80 and
+            break_pressure >= 0.92
+        ):
+            return True
+
+    # 2) BREAKOUT chỉ lấy loại mới break sớm, chưa chạy quá xa
+    if status == "BREAKOUT":
+        if (
+            score >= 8.5 and
+            break_pressure >= 0.985 and
+            roc_10_pct <= 12
+        ):
+            return True
+
+    # Không gửi EARLY_FLOW nữa để tránh spam
     return False
-
 
 def format_alert(row):
     holder_txt = "N/A" if pd.isna(row["top10_holder_pct"]) else f"{row['top10_holder_pct']}%"
@@ -925,7 +939,31 @@ def format_alert(row):
         f"🏷 Holder Flag: {row['holder_flag']}\n"
     )
 
+def format_batch_alert(rows):
+    lines = []
+    lines.append("🔥 <b>SPOT GEM ALERT</b>")
+    lines.append("Các coin diện <b>sắp chạy</b>:")
 
+    for i, row in enumerate(rows, start=1):
+        holder_txt = "N/A"
+        if row.get("top10_holder_pct") not in [None, "", "nan"]:
+            holder_txt = f"{row['top10_holder_pct']}%"
+
+        lines.append("")
+        lines.append(f"<b>{i}. {row['symbol']}</b>")
+        lines.append(f"💰 Price: {row['price']}")
+        lines.append(f"🧭 Status: {row['status']} | 📊 Score: {row['score']}")
+        lines.append(
+            f"📈 Vol: {row['vol_ratio']} | "
+            f"🧱 Comp: {row['compression']} | "
+            f"🚀 Break: {row['break_pressure']}"
+        )
+        lines.append(f"🐋 Holder: {holder_txt} | 🎯 {row['hunter_priority']}")
+
+    lines.append("")
+    lines.append("⚠️ Gợi ý: ưu tiên coin PRE_BREAK, tránh FOMO coin đã chạy xa.")
+
+    return "\n".join(lines)
 # =========================================================
 # MAIN
 # =========================================================
@@ -1066,11 +1104,27 @@ def run():
     df = df.sort_values(["score", "top10_holder_pct"], ascending=[False, False], na_position="last").reset_index(drop=True)
 
     # anti-spam telegram
+    # =========================
+    # GOM ALERT THÀNH 1 TIN
+    # =========================
+    alert_rows = []
     for _, row in df.iterrows():
         key = f"{row['symbol']}_{row['status']}"
+    
         if should_alert(row) and key not in sent:
-            send_telegram(format_alert(row))
+            alert_rows.append(row.to_dict())
             sent[key] = {"time": utc_now().isoformat()}
+    
+    # chỉ gửi 1 tin duy nhất nếu có coin đủ điều kiện
+    if alert_rows:
+        # sort lại cho đẹp: score cao nhất lên đầu
+        alert_rows = sorted(alert_rows, key=lambda x: safe_float(x.get("score"), 0.0), reverse=True)
+    
+        # giới hạn 10 coin để tin không quá dài
+        alert_rows = alert_rows[:10]
+    
+        batch_msg = format_batch_alert(alert_rows)
+        send_telegram(batch_msg)
     save_sent(sent)
     json_save_file("resolve_cache.json", resolve_cache)
 
