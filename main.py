@@ -290,24 +290,40 @@ def classify_status(f):
     bp = f["break_pressure"]
     roc10 = f["roc_10"]
 
+    # Chết / ngủ
     if vr < 0.75 and bp < 0.85:
         return "DEAD"
-    if vr < 0.90 and cp >= 0.85:
+
+    if vr < 0.95 and cp >= 0.90:
         return "SLEEPING"
-    if vr >= 1.10 and cp >= 0.80 and not hl:
-        return "WAKING_UP"
-    if vr >= 1.25 and hl and bp >= 0.82:
+
+    # Bắt đầu có dòng tiền
+    if vr >= 1.10 and hl and bp >= 0.80 and cp > 0.80:
         return "EARLY_FLOW"
-    if vr >= 1.35 and cp <= 0.75 and hl and bp >= 0.90:
+
+    # Giai đoạn ngon nhất: nén + áp sát đỉnh + có vol
+    if (
+        vr >= 1.35 and
+        hl and
+        cp <= 0.80 and
+        bp >= 0.92 and
+        roc10 <= 0.12
+    ):
         return "PRE_BREAK"
+
+    # Mới break sớm
     if bp >= 0.985 and roc10 > 0.03:
         return "BREAKOUT"
+
+    # Chạy quá mạnh rồi
     if roc10 > 0.12 and bp >= 0.99:
         return "PUMPING"
+
+    # Dump
     if roc10 < -0.10:
         return "DUMPING"
-    return "SLEEPING"
 
+    return "SLEEPING"
 
 def calc_score(f, status, holder_score=0.0):
     if f is None:
@@ -674,7 +690,140 @@ def get_holder_info_from_resolve(resolved_info: dict):
         "holder_score": score,
         "holder_note": "",
     }
+def resolve_with_dexscreener(symbol_base):
+    url = f"https://api.dexscreener.com/latest/dex/search?q={symbol_base}"
 
+    try:
+        res = requests.get(url, timeout=20).json()
+        pairs = res.get("pairs", [])
+    except Exception:
+        return None
+
+    if not pairs:
+        return None
+
+    candidates = []
+
+    for p in pairs[:25]:
+        base_token = p.get("baseToken", {}) or {}
+        chain_id = str(p.get("chainId", "")).lower().strip()
+        liquidity = float(p.get("liquidity", {}).get("usd", 0) or 0)
+        volume = float(p.get("volume", {}).get("h24", 0) or 0)
+
+        buys = int(p.get("txns", {}).get("h24", {}).get("buys", 0) or 0)
+        sells = int(p.get("txns", {}).get("h24", {}).get("sells", 0) or 0)
+
+        token_symbol = str(base_token.get("symbol", "")).lower().strip()
+        token_name = str(base_token.get("name", "")).lower().strip()
+        symbol_q = symbol_base.lower().strip()
+
+        score = 0.0
+
+        # khớp symbol
+        if token_symbol == symbol_q:
+            score += 60
+        elif symbol_q in token_symbol:
+            score += 25
+
+        # khớp name
+        if token_name == symbol_q:
+            score += 20
+        elif symbol_q in token_name:
+            score += 8
+
+        # liquidity / volume / tx
+        if liquidity > 10000:
+            score += 10
+        if liquidity > 100000:
+            score += 10
+        if volume > 10000:
+            score += 5
+        if volume > 100000:
+            score += 5
+        if buys + sells > 20:
+            score += 5
+
+        candidates.append({
+            "score": round(score, 2),
+            "chain_id": chain_id,
+            "token_address": base_token.get("address"),
+            "resolved_symbol": base_token.get("symbol"),
+            "resolved_name": base_token.get("name"),
+            "liquidity_usd": liquidity,
+            "volume_h24": volume,
+            "pair_url": p.get("url"),
+        })
+
+    if not candidates:
+        return None
+
+    candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
+    return candidates[0]
+
+
+def map_chain_to_moralis(chain_id):
+    mapping = {
+        "bsc": ("evm", "bsc"),
+        "ethereum": ("evm", "eth"),
+        "eth": ("evm", "eth"),
+        "polygon": ("evm", "polygon"),
+        "polygonzk": ("evm", "polygon"),
+        "arbitrum": ("evm", "arbitrum"),
+        "optimism": ("evm", "optimism"),
+        "base": ("evm", "base"),
+        "avalanche": ("evm", "avalanche"),
+        "solana": ("solana", "mainnet"),
+    }
+    return mapping.get(chain_id, (None, None))
+
+
+def resolve_symbol_auto(symbol, resolve_cache):
+    # symbol ví dụ: ZEUS-USDT
+    if symbol in resolve_cache:
+        return resolve_cache[symbol]
+
+    symbol_base = symbol.split("-")[0].strip()
+    best = resolve_with_dexscreener(symbol_base)
+
+    if not best:
+        result = {
+            "resolved": False,
+            "resolve_confidence": 0.0,
+            "reason": "no_dex_candidate",
+            "chain_type": None,
+            "network": None,
+            "token_address": None,
+            "resolved_name": None,
+            "resolved_symbol": None,
+            "last_verified_at": utc_now_str(),
+        }
+        resolve_cache[symbol] = result
+        return result
+
+    chain_type, network = map_chain_to_moralis(best["chain_id"])
+    confidence = float(best["score"])
+
+    resolved = (
+        confidence >= 60 and
+        best.get("token_address") and
+        chain_type is not None and
+        network is not None
+    )
+
+    result = {
+        "resolved": resolved,
+        "resolve_confidence": round(confidence, 2),
+        "reason": "ok" if resolved else "low_confidence_or_unsupported_chain",
+        "chain_type": chain_type,
+        "network": network,
+        "token_address": best.get("token_address"),
+        "resolved_name": best.get("resolved_name"),
+        "resolved_symbol": best.get("resolved_symbol"),
+        "last_verified_at": utc_now_str(),
+    }
+
+    resolve_cache[symbol] = result
+    return result
 
 # =========================================================
 # TRACKING
@@ -900,26 +1049,24 @@ def should_alert(row):
     break_pressure = safe_float(row.get("break_pressure"), 0.0)
     roc_10_pct = safe_float(row.get("roc_10_pct"), 0.0)
 
-    # 1) Chỉ ưu tiên coin "sắp chạy"
+    # Chỉ gửi PRE_BREAK thật sự đẹp
     if status == "PRE_BREAK":
-        if (
+        return (
             score >= 8.0 and
             vol_ratio >= 1.35 and
             compression <= 0.80 and
-            break_pressure >= 0.92
-        ):
-            return True
+            break_pressure >= 0.92 and
+            roc_10_pct <= 12
+        )
 
-    # 2) BREAKOUT chỉ lấy loại mới break sớm, chưa chạy quá xa
+    # BREAKOUT chỉ lấy loại mới break sớm
     if status == "BREAKOUT":
-        if (
+        return (
             score >= 8.5 and
             break_pressure >= 0.985 and
             roc_10_pct <= 12
-        ):
-            return True
+        )
 
-    # Không gửi EARLY_FLOW nữa để tránh spam
     return False
 
 def format_alert(row):
@@ -958,10 +1105,10 @@ def format_batch_alert(rows):
             f"🧱 Comp: {row['compression']} | "
             f"🚀 Break: {row['break_pressure']}"
         )
-        lines.append(f"🐋 Holder: {holder_txt} | 🎯 {row['hunter_priority']}")
+        lines.append(f"🐋 Holder: {holder_txt} | 🔎 Resolve: {row['resolve_confidence']}")
 
     lines.append("")
-    lines.append("⚠️ Gợi ý: ưu tiên coin PRE_BREAK, tránh FOMO coin đã chạy xa.")
+    lines.append("⚠️ Chỉ là radar săn coin sắp chạy, không phải tín hiệu vào lệnh tự động.")
 
     return "\n".join(lines)
 # =========================================================
@@ -1114,17 +1261,10 @@ def run():
         if should_alert(row) and key not in sent:
             alert_rows.append(row.to_dict())
             sent[key] = {"time": utc_now().isoformat()}
-    
-    # chỉ gửi 1 tin duy nhất nếu có coin đủ điều kiện
     if alert_rows:
-        # sort lại cho đẹp: score cao nhất lên đầu
         alert_rows = sorted(alert_rows, key=lambda x: safe_float(x.get("score"), 0.0), reverse=True)
-    
-        # giới hạn 10 coin để tin không quá dài
         alert_rows = alert_rows[:10]
-    
-        batch_msg = format_batch_alert(alert_rows)
-        send_telegram(batch_msg)
+        send_telegram(format_batch_alert(alert_rows))
     save_sent(sent)
     json_save_file("resolve_cache.json", resolve_cache)
 
