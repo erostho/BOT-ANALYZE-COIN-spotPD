@@ -44,6 +44,10 @@ ALERT_MIN_SCORE_PREBREAK = float(os.getenv("ALERT_MIN_SCORE_PREBREAK", "7.0"))
 ALERT_MIN_SCORE_EARLY = float(os.getenv("ALERT_MIN_SCORE_EARLY", "6.5"))
 ALERT_MIN_SCORE_BREAKOUT = float(os.getenv("ALERT_MIN_SCORE_BREAKOUT", "7.5"))
 
+HOLDER_CHECK_TOP_N = int(os.getenv("HOLDER_CHECK_TOP_N", "10"))   # chỉ check holder cho top 10 coin
+HOLDER_CACHE_HOURS = int(os.getenv("HOLDER_CACHE_HOURS", "12")) # cache holder 12h
+RESOLVE_TOP_N = int(os.getenv("RESOLVE_TOP_N", "50"))           # resolve top 50 coin thôi
+
 
 # =========================================================
 # HTTP
@@ -103,7 +107,26 @@ def json_save_file(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def load_holder_cache():
+    return json_load_file("holder_cache.json", {})
 
+def save_holder_cache(data):
+    json_save_file("holder_cache.json", data)
+
+def holder_cache_key(resolved_info):
+    chain_type = resolved_info.get("chain_type")
+    network = resolved_info.get("network")
+    token_address = resolved_info.get("token_address")
+    return f"{chain_type}:{network}:{token_address}"
+
+def is_holder_cache_valid(item, hours=12):
+    if not item:
+        return False
+    try:
+        ts = datetime.fromisoformat(item["time"])
+        return utc_now() - ts <= timedelta(hours=hours)
+    except Exception:
+        return False
 # =========================================================
 # GOOGLE SHEETS
 # =========================================================
@@ -690,11 +713,20 @@ def get_holder_info_from_resolve(resolved_info: dict):
         else:
             top10_pct = None
     except Exception as e:
+        msg = str(e)
+    
+        if "401" in msg or "Unauthorized" in msg:
+            flag = "BAD_API_KEY_OR_QUOTA"
+        elif "429" in msg:
+            flag = "RATE_LIMIT"
+        else:
+            flag = "HOLDER_API_ERR"
+    
         return {
             "top10_holder_pct": None,
-            "holder_flag": "ERR",
+            "holder_flag": flag,
             "holder_score": 0.0,
-            "holder_note": str(e)[:120],
+            "holder_note": msg[:150],
         }
 
     if top10_pct is None:
@@ -1105,6 +1137,35 @@ def should_alert(row):
         )
 
     return False
+
+def should_resolve(row):
+    status = str(row.get("status", ""))
+    score = safe_float(row.get("score"), 0.0)
+    vol_ratio = safe_float(row.get("vol_ratio"), 0.0)
+    break_pressure = safe_float(row.get("break_pressure"), 0.0)
+
+    return (
+        status == "PRE_BREAK" and
+        score >= 9.0 and
+        vol_ratio >= 1.4 and
+        break_pressure >= 0.93
+    )
+
+def should_fetch_holder(row):
+    status = str(row.get("status", ""))
+    score = safe_float(row.get("score"), 0.0)
+    vol_ratio = safe_float(row.get("vol_ratio"), 0.0)
+    compression = safe_float(row.get("compression"), 99.0)
+    break_pressure = safe_float(row.get("break_pressure"), 0.0)
+
+    return (
+        status == "PRE_BREAK" and
+        score >= 10.0 and
+        vol_ratio >= 1.5 and
+        compression <= 0.80 and
+        break_pressure >= 0.95
+    )
+    
 def is_valid_candidate(row):
     price = safe_float(row.get("price"), 0)
     symbol = str(row.get("symbol", ""))
@@ -1184,7 +1245,7 @@ def run():
     print("🚀 START OKX SPOT HUNTER V4")
     sent = cleanup_sent(load_sent())
     resolve_cache = json_load_file("resolve_cache.json", {})
-
+    holder_cache = load_holder_cache()
     sh = init_sheet()
 
     print("📡 Fetching OKX spot tickers...")
@@ -1271,17 +1332,21 @@ def run():
 
     # sort trước, rồi chỉ enrich holder cho nhóm đáng chú ý
     df = df.sort_values(["score"], ascending=[False]).reset_index(drop=True)
+    # shortlist resolve: chỉ resolve top coin đáng chú ý
+    resolve_candidates = df[df.apply(should_resolve, axis=1)].copy()
+    
+    # nếu ít quá thì lấy thêm top score
+    if len(resolve_candidates) < RESOLVE_TOP_N:
+        extra = df.head(RESOLVE_TOP_N)
+        resolve_candidates = pd.concat([resolve_candidates, extra]).drop_duplicates(subset=["symbol"])
+    
+    resolve_candidates = resolve_candidates.head(RESOLVE_TOP_N)
+    resolve_indexes = resolve_candidates.index.tolist()
 
-    resolve_mask = (
-        df["status"].isin(RESOLVE_STATUS_SET) |
-        (df.index < RESOLVE_TOP_N)
-    )
-
-    for idx in df[resolve_mask].index.tolist():
+    for idx in resolve_indexes:
         symbol = df.at[idx, "symbol"]
         try:
             resolved_info = resolve_symbol_auto(symbol, resolve_cache)
-
             df.at[idx, "resolve_confidence"] = resolved_info.get("resolve_confidence", 0.0)
             df.at[idx, "chain_type"] = resolved_info.get("chain_type")
             df.at[idx, "network"] = resolved_info.get("network")
@@ -1289,7 +1354,32 @@ def run():
             df.at[idx, "resolved_name"] = resolved_info.get("resolved_name")
             df.at[idx, "resolved_symbol"] = resolved_info.get("resolved_symbol")
 
-            holder_info = get_holder_info_from_resolve(resolved_info)
+            row_dict = df.loc[idx].to_dict()
+            # mặc định không fetch holder
+            holder_info = {
+                "top10_holder_pct": None,
+                "holder_flag": "SKIPPED",
+                "holder_score": 0.0,
+                "holder_note": "not in holder shortlist"
+            }
+            
+            # chỉ fetch holder cho top ít coin thật sự đẹp
+            if should_fetch_holder(row_dict):
+                cache_key = holder_cache_key(resolved_info)
+            
+                # dùng cache nếu còn hạn
+                cached = holder_cache.get(cache_key)
+                if is_holder_cache_valid(cached, hours=HOLDER_CACHE_HOURS):
+                    holder_info = cached["data"]
+                else:
+                    holder_info = get_holder_info_from_resolve(resolved_info)
+            
+                    # chỉ cache nếu có dữ liệu hoặc có flag rõ ràng
+                    holder_cache[cache_key] = {
+                        "time": utc_now().isoformat(),
+                        "data": holder_info
+                    }
+            
             df.at[idx, "top10_holder_pct"] = holder_info["top10_holder_pct"]
             df.at[idx, "holder_flag"] = holder_info["holder_flag"]
             df.at[idx, "holder_score"] = holder_info["holder_score"]
@@ -1333,7 +1423,7 @@ def run():
         send_telegram(format_batch_alert(alert_rows))
     save_sent(sent)
     json_save_file("resolve_cache.json", resolve_cache)
-
+    save_holder_cache(holder_cache)
     # sheet: HUNTER_BOARD
     ws_board = get_or_create_ws(sh, "HUNTER_BOARD", rows=6000, cols=40)
     overwrite_worksheet(ws_board, df)
